@@ -194,6 +194,14 @@ static GTY(()) section *debug_frame_section;
 #define DWARF_INITIAL_LENGTH_SIZE_STR (dwarf_offset_size == 4 ? "-4" : "-12")
 #endif
 
+/* The unit of the offsets from the stack pointer and the frame base in
+   location expressions, in bytes.  It differs from 1 on targets whose
+   debuggers see the stack pointer in larger units than the compiler's
+   stack offsets.  */
+#ifndef DWARF_STACK_UNIT_SIZE
+#define DWARF_STACK_UNIT_SIZE 1
+#endif
+
 /* Round SIZE up to the nearest BOUNDARY.  */
 #define DWARF_ROUND(SIZE,BOUNDARY) \
   ((((SIZE) + (BOUNDARY) - 1) / (BOUNDARY)) * (BOUNDARY))
@@ -15180,6 +15188,24 @@ address_of_int_loc_descriptor (int size, HOST_WIDE_INT i)
   return loc_result;
 }
 
+/* Convert *OFFSET, a byte offset from the stack pointer or the frame
+   base, to the units of DWARF_STACK_UNIT_SIZE.  Return false if it
+   isn't a whole number of units.  */
+
+static bool
+stack_offset_to_dwarf_units (poly_int64 *offset)
+{
+  HOST_WIDE_INT const_offset;
+
+  if (DWARF_STACK_UNIT_SIZE == 1)
+    return true;
+  if (!offset->is_constant (&const_offset)
+      || const_offset % DWARF_STACK_UNIT_SIZE != 0)
+    return false;
+  *offset = const_offset / DWARF_STACK_UNIT_SIZE;
+  return true;
+}
+
 /* Return a location descriptor that designates a base+offset location.  */
 
 static dw_loc_descr_ref
@@ -15226,6 +15252,8 @@ based_loc_descr (rtx reg, poly_int64 offset,
 
 	  gcc_assert (frame_pointer_fb_offset_valid);
 	  offset += frame_pointer_fb_offset;
+	  if (!stack_offset_to_dwarf_units (&offset))
+	    return NULL;
 	  HOST_WIDE_INT const_offset;
 	  if (offset.is_constant (&const_offset))
 	    return new_loc_descr (DW_OP_fbreg, const_offset, 0);
@@ -15263,6 +15291,9 @@ based_loc_descr (rtx reg, poly_int64 offset,
       return new_loc_descr (DW_OP_fbreg, const_offset, 0);
     }
 
+  if (REGNO (reg) == STACK_POINTER_REGNUM
+      && !stack_offset_to_dwarf_units (&offset))
+    return NULL;
   result = new_reg_loc_descr (regno, offset);
 
   if (initialized == VAR_INIT_STATUS_UNINITIALIZED)

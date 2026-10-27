@@ -3973,6 +3973,17 @@ should return the .eh_frame register number.  The default is
 @code{DEBUGGER_REGNO (@var{regno})}.
 @end defmac
 
+@defmac DWARF_STACK_UNIT_SIZE
+
+Define this macro to the size in bytes of the unit of offsets from the
+stack pointer and from the frame base in DWARF location expressions, if
+it isn't 1.  This is for targets whose debuggers see the stack pointer
+in larger units than the compiler's stack offsets, such as word
+addressed machines; the call frame information should then use the
+same units.  An offset that isn't a whole number of units makes the
+location unknown.
+@end defmac
+
 @defmac DWARF2_FRAME_REG_OUT (@var{regno}, @var{for_eh})
 
 Define this macro to map register numbers held in the call frame info
