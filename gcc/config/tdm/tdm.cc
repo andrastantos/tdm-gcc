@@ -532,6 +532,94 @@ tdm_emit_rotate (const char *op, const tdm_loc &d)
     tdm_emit ("%s\t%s", op, tdm_opb_text (d));
 }
 
+/* Octet access through a byte pointer in $r0, whose half is only
+   known at run time.  C data lives in the first 32K words, so after
+   "ror $r0" bit 15 holds the half and the rest the word address.  The
+   high half path clears bit 15 with $mr5 (0x7fff) and puts $r0 back
+   with "rol; add 1", the low half path with "rol".  The jumps skip
+   fixed instruction counts.  OFF is the byte offset of the access.  */
+
+/* Load the octet at [$r0 + OFF], zero extended, into register D.  */
+
+static void
+tdm_emit_load_octet_dynamic (const tdm_loc &d, HOST_WIDE_INT off)
+{
+  tdm_loc r0 = tdm_make_loc (LOC_R0);
+
+  gcc_assert (tdm_reg_loc_p (d) || d.kind == LOC_MR);
+  if (d.kind != LOC_R1)
+    tdm_emit ("mov\t[$sp-1], $r1");
+  if (off)
+    tdm_emit_to_reg ("add", r0, tdm_make_loc (LOC_IMM, tdm_sext16 (off)));
+  tdm_emit ("ror\t$r0");
+  tdm_emit ("if_ges\t$r0, 0");
+  tdm_emit ("mov\t$pc, $pc+14");
+  /* High half.  */
+  tdm_emit ("and\t$r0, $mr5");
+  tdm_emit ("mov\t$r1, [$r0]");
+  for (int i = 0; i < 8; i++)
+    tdm_emit ("ror\t$r1");
+  tdm_emit ("rol\t$r0");
+  tdm_emit ("add\t$r0, 1");
+  tdm_emit ("mov\t$pc, $pc+3");
+  /* Low half.  */
+  tdm_emit ("mov\t$r1, [$r0]");
+  tdm_emit ("rol\t$r0");
+  tdm_emit ("and\t$r1, $mr3");
+
+  switch (d.kind)
+    {
+    case LOC_R1:
+      break;
+    case LOC_R0:
+      tdm_emit ("swap\t$r1, [$sp-1]");
+      tdm_emit ("mov\t$r0, [$sp-1]");
+      return;
+    default:
+      tdm_emit ("mov\t%s, $r1", tdm_opb_text (d));
+      tdm_emit ("mov\t$r1, [$sp-1]");
+      break;
+    }
+  if (off)
+    tdm_emit_to_reg ("add", r0, tdm_make_loc (LOC_IMM, tdm_sext16 (-off)));
+}
+
+/* Store the low octet of S at [$r0 + OFF]:
+   mem ^= (value ^ mem) & mask, in $r1.  */
+
+static void
+tdm_emit_store_octet_dynamic (const tdm_loc &s, HOST_WIDE_INT off)
+{
+  tdm_loc r0 = tdm_make_loc (LOC_R0);
+
+  tdm_emit ("mov\t[$sp-1], $r1");
+  tdm_emit_to_reg ("mov", tdm_r1, s);
+  if (off)
+    tdm_emit_to_reg ("add", r0, tdm_make_loc (LOC_IMM, tdm_sext16 (off)));
+  tdm_emit ("ror\t$r0");
+  tdm_emit ("if_ges\t$r0, 0");
+  tdm_emit ("mov\t$pc, $pc+16");
+  /* High half.  */
+  tdm_emit ("and\t$r0, $mr5");
+  for (int i = 0; i < 8; i++)
+    tdm_emit ("rol\t$r1");
+  tdm_emit ("xor\t$r1, [$r0]");
+  tdm_emit ("and\t$r1, $mr4");
+  tdm_emit ("xor\t[$r0], $r1");
+  tdm_emit ("rol\t$r0");
+  tdm_emit ("add\t$r0, 1");
+  tdm_emit ("mov\t$pc, $pc+5");
+  /* Low half.  */
+  tdm_emit ("xor\t$r1, [$r0]");
+  tdm_emit ("and\t$r1, $mr3");
+  tdm_emit ("xor\t[$r0], $r1");
+  tdm_emit ("rol\t$r0");
+
+  if (off)
+    tdm_emit_to_reg ("add", r0, tdm_make_loc (LOC_IMM, tdm_sext16 (-off)));
+  tdm_emit ("mov\t$r1, [$sp-1]");
+}
+
 /* Emit an 8-bit move.  Octets in memory are the low or the high half
    of a word.  */
 
@@ -544,7 +632,7 @@ tdm_emit_movqi (const tdm_loc &d, const tdm_loc &s)
 
       if (s.dynamic)
 	{
-	  tdm_sorry ("octet access through a pointer");
+	  tdm_emit_load_octet_dynamic (d, s.n * 2 + s.high);
 	  return;
 	}
       w.high = false;
@@ -561,7 +649,7 @@ tdm_emit_movqi (const tdm_loc &d, const tdm_loc &s)
 
       if (d.dynamic)
 	{
-	  tdm_sorry ("octet access through a pointer");
+	  tdm_emit_store_octet_dynamic (s, d.n * 2 + d.high);
 	  return;
 	}
       w.high = false;
