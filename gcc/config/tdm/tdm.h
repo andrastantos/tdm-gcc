@@ -258,6 +258,26 @@ enum reg_class
 
 #define DWARF2_UNWIND_INFO 0
 
+/* Debug information.  The DWARF numbers of $pc, $sp, $r0 and $r1 are
+   GDB's (and the simulator's): 0 to 3.  $mrN is 4+N.  */
+
+#define DEBUGGER_REGNO(REGNO)					\
+  ((REGNO) == PC_REGNUM ? 0U						\
+   : (REGNO) == SP_REGNUM ? 1U						\
+   : (REGNO) <= R1_REGNUM ? (unsigned) (REGNO) + 2			\
+   : TDM_MR_P (REGNO) ? (unsigned) ((REGNO) - MR0_REGNUM) + 4		\
+   : INVALID_REGNUM)
+
+/* Call frame information counts words, as GDB does: the CFA is the word
+   address of the return address, the caller's $sp at the call, and the
+   return address is the PC column.  The compiler's stack offsets count
+   octets, so the prologue and the epilogue describe their effect with
+   notes in words, and the data alignment factor is a single word.  */
+
+#define INCOMING_RETURN_ADDR_RTX gen_rtx_MEM (Pmode, stack_pointer_rtx)
+#define DWARF_FRAME_RETURN_COLUMN DWARF_FRAME_REGNUM (PC_REGNUM)
+#define DWARF_CIE_DATA_ALIGNMENT (-1)
+
 #define HAS_LONG_COND_BRANCH true
 #define HAS_LONG_UNCOND_BRANCH true
 
