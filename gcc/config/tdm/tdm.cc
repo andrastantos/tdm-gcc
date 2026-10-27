@@ -996,6 +996,35 @@ tdm_initial_elimination_offset (int from, int to)
   return f.total ? 2 + f.outgoing + f.saved : 0;
 }
 
+/* Call frame information counts words (see tdm.h), so the frame
+   related insns below carry notes with word offsets: the compiler's
+   octet offsets halved.  */
+
+/* Emit $sp += BYTES, described for the CFI.  */
+
+static void
+tdm_emit_sp_adjust (HOST_WIDE_INT bytes)
+{
+  rtx_insn *insn = emit_insn (gen_addhi3 (stack_pointer_rtx,
+					  stack_pointer_rtx,
+					  GEN_INT (bytes)));
+  RTX_FRAME_RELATED_P (insn) = 1;
+  add_reg_note (insn, REG_CFA_ADJUST_CFA,
+		gen_rtx_SET (stack_pointer_rtx,
+			     plus_constant (Pmode, stack_pointer_rtx,
+					    bytes / 2)));
+}
+
+/* The saved register slot at OFF octets above $sp, and the same slot
+   in words for the CFI.  */
+
+static rtx
+tdm_save_slot (HOST_WIDE_INT off, bool words)
+{
+  return gen_frame_mem (HImode, plus_constant (Pmode, stack_pointer_rtx,
+					       words ? off / 2 : off));
+}
+
 void
 tdm_expand_prologue (void)
 {
@@ -1008,8 +1037,7 @@ tdm_expand_prologue (void)
 
   tdm_compute_frame (&f);
   if (f.total)
-    emit_insn (gen_addhi3 (stack_pointer_rtx, stack_pointer_rtx,
-			   GEN_INT (-f.total)));
+    tdm_emit_sp_adjust (-f.total);
 
   off = 2 + f.outgoing;
   if (f.saved && off + f.saved > 64)
@@ -1017,10 +1045,12 @@ tdm_expand_prologue (void)
   for (unsigned int regno = MR0_REGNUM; regno <= MR31_REGNUM; regno++)
     if (tdm_save_reg_p (regno))
       {
-	emit_move_insn (gen_frame_mem (HImode,
-				       plus_constant (Pmode,
-						      stack_pointer_rtx, off)),
-			gen_rtx_REG (HImode, regno));
+	rtx reg = gen_rtx_REG (HImode, regno);
+	rtx_insn *insn = emit_move_insn (tdm_save_slot (off, false), reg);
+
+	RTX_FRAME_RELATED_P (insn) = 1;
+	add_reg_note (insn, REG_CFA_OFFSET,
+		      gen_rtx_SET (tdm_save_slot (off, true), reg));
 	off += 2;
       }
 }
@@ -1036,17 +1066,17 @@ tdm_expand_epilogue (void)
   for (unsigned int regno = MR0_REGNUM; regno <= MR31_REGNUM; regno++)
     if (tdm_save_reg_p (regno))
       {
-	emit_move_insn (gen_rtx_REG (HImode, regno),
-			gen_frame_mem (HImode,
-				       plus_constant (Pmode,
-						      stack_pointer_rtx, off)));
+	rtx reg = gen_rtx_REG (HImode, regno);
+	rtx_insn *insn = emit_move_insn (reg, tdm_save_slot (off, false));
+
+	RTX_FRAME_RELATED_P (insn) = 1;
+	add_reg_note (insn, REG_CFA_RESTORE, reg);
 	off += 2;
       }
   if (f.total)
     {
       emit_insn (gen_blockage ());
-      emit_insn (gen_addhi3 (stack_pointer_rtx, stack_pointer_rtx,
-			     GEN_INT (f.total)));
+      tdm_emit_sp_adjust (f.total);
     }
   emit_jump_insn (gen_return_internal ());
 }
@@ -1405,10 +1435,12 @@ tdm_init_libfuncs (void)
 #define TARGET_ASM_ALIGNED_SI_OP "\t.long\t"
 #undef  TARGET_ASM_ALIGNED_DI_OP
 #define TARGET_ASM_ALIGNED_DI_OP NULL
+/* Unaligned data only occurs in the debug sections, which the
+   assembler addresses in octets.  */
 #undef  TARGET_ASM_UNALIGNED_HI_OP
-#define TARGET_ASM_UNALIGNED_HI_OP NULL
+#define TARGET_ASM_UNALIGNED_HI_OP "\t.2byte\t"
 #undef  TARGET_ASM_UNALIGNED_SI_OP
-#define TARGET_ASM_UNALIGNED_SI_OP NULL
+#define TARGET_ASM_UNALIGNED_SI_OP "\t.4byte\t"
 #undef  TARGET_ASM_UNALIGNED_DI_OP
 #define TARGET_ASM_UNALIGNED_DI_OP NULL
 #undef  TARGET_CONSTANT_ALIGNMENT
