@@ -30,11 +30,19 @@
 (define_constants
   [(R0_REGNUM	0)
    (R1_REGNUM	1)
+   (HFP_REGNUM	8)	; $mr6
+   (GOTO_LABEL_REGNUM 9)	; $mr7
+   (GOTO_FP_REGNUM 10)	; $mr8
+   (GOTO_SP_REGNUM 11)	; $mr9
    (SP_REGNUM	34)
    (PC_REGNUM	35)])
 
+(define_c_enum "unspec"
+  [UNSPEC_RAW_FP])
+
 (define_c_enum "unspecv"
-  [UNSPECV_BLOCKAGE])
+  [UNSPECV_BLOCKAGE
+   UNSPECV_NONLOCAL_JUMP])
 
 ;; Lengths are in octets, two per instruction.  tdm_insn_length counts
 ;; the instructions the output functions emit.
@@ -53,6 +61,28 @@
       && !register_operand (operands[1], HImode))
     operands[1] = force_reg (HImode, operands[1]);
 })
+
+;; The frame pointer $mr6 holds a word address, which moves double
+;; and halve like those of $sp (see tdm_classify).  The prologue and
+;; the epilogue copy it as it is.
+
+(define_insn "tdm_sp_from_fp"
+  [(set (reg:HI SP_REGNUM) (reg:HI HFP_REGNUM))]
+  "frame_pointer_needed"
+  "mov\t$sp, $mr6")
+
+(define_insn "tdm_save_fp"
+  [(set (match_operand:HI 0 "memory_operand" "=m")
+	(unspec:HI [(reg:HI HFP_REGNUM)] UNSPEC_RAW_FP))]
+  ""
+  "* return tdm_output_raw_fp (operands[0], true);")
+
+(define_insn "tdm_restore_fp"
+  [(set (reg:HI HFP_REGNUM)
+	(unspec:HI [(match_operand:HI 0 "memory_operand" "m")]
+		   UNSPEC_RAW_FP))]
+  ""
+  "* return tdm_output_raw_fp (operands[0], false);")
 
 (define_insn "*movhi"
   [(set (match_operand:HI 0 "nonimmediate_operand" "=r,m,Q,r,k")
@@ -116,18 +146,18 @@
   "tdm_fix_operand_pairs (operands, 2);")
 
 (define_insn "*addhi3"
-  [(set (match_operand:HI 0 "nonimmediate_operand" "=r,m,Q,k")
-	(plus:HI (match_operand:HI 1 "nonimmediate_operand" "%0,0,0,0")
-		 (match_operand:HI 2 "general_operand" "rmi,rQi,m,n")))]
+  [(set (match_operand:HI 0 "nonimmediate_operand" "=r,m,Q,k,k")
+	(plus:HI (match_operand:HI 1 "nonimmediate_operand" "%0,0,0,0,0")
+		 (match_operand:HI 2 "general_operand" "rmi,rQi,m,n,q")))]
   "tdm_operand_pair_ok_p (operands[0], operands[1])
    && tdm_operand_pair_ok_p (operands[0], operands[2])
    && tdm_operand_pair_ok_p (operands[1], operands[2])"
   "* return tdm_output_binop (\"add\", operands);")
 
 (define_insn "*subhi3"
-  [(set (match_operand:HI 0 "nonimmediate_operand" "=r,m,Q,k")
-	(minus:HI (match_operand:HI 1 "nonimmediate_operand" "0,0,0,0")
-		  (match_operand:HI 2 "general_operand" "rmi,rQi,m,n")))]
+  [(set (match_operand:HI 0 "nonimmediate_operand" "=r,m,Q,k,k")
+	(minus:HI (match_operand:HI 1 "nonimmediate_operand" "0,0,0,0,0")
+		  (match_operand:HI 2 "general_operand" "rmi,rQi,m,n,q")))]
   "tdm_operand_pair_ok_p (operands[0], operands[1])
    && tdm_operand_pair_ok_p (operands[0], operands[2])
    && tdm_operand_pair_ok_p (operands[1], operands[2])"
@@ -314,15 +344,31 @@
   "mov\t$pc, [$sp]"
   [(set_attr "length" "2")])
 
-(define_expand "allocate_stack"
-  [(match_operand:HI 0 "register_operand")
-   (match_operand:HI 1 "general_operand")]
+;; Nonlocal gotos and __builtin_longjmp.  The saved $sp and frame
+;; pointer are byte addresses; halve them on the way.  Operand 0, the
+;; static chain, isn't needed.
+
+(define_expand "nonlocal_goto"
+  [(match_operand 0 "general_operand")
+   (match_operand 1 "general_operand")
+   (match_operand 2 "general_operand")
+   (match_operand 3 "general_operand")]
   ""
 {
-  sorry ("variable-sized stack frames are not supported on TDM yet");
-  emit_move_insn (operands[0], stack_pointer_rtx);
+  tdm_expand_nonlocal_goto (operands);
   DONE;
 })
+
+(define_insn "tdm_nonlocal_jump"
+  [(set (pc) (unspec_volatile [(reg:HI GOTO_LABEL_REGNUM)
+			       (reg:HI GOTO_FP_REGNUM)
+			       (reg:HI GOTO_SP_REGNUM)]
+			      UNSPECV_NONLOCAL_JUMP))
+   (clobber (reg:HI R0_REGNUM))
+   (clobber (reg:HI HFP_REGNUM))
+   (clobber (reg:HI SP_REGNUM))]
+  ""
+  "mov\t$r0, $mr8\;ror\t$r0\;mov\t$mr6, $r0\;mov\t$r0, $mr9\;ror\t$r0\;mov\t$sp, $r0\;mov\t$pc, $mr7")
 
 (define_insn "blockage"
   [(unspec_volatile [(const_int 0)] UNSPECV_BLOCKAGE)]

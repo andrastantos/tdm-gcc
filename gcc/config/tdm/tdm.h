@@ -103,7 +103,9 @@
      $mr0-$mr2	 hardware (reset/interrupt vector, SWAPI scratch); free
 		 with -muser-mode
      $mr3-$mr5	 constants 0x00ff, 0xff00 and 0x7fff, set up by crt0
-     $mr6-$mr18	 caller saved
+     $mr6	 frame pointer in functions that need one, which holds a
+		 word address like $sp; otherwise callee saved
+     $mr7-$mr18	 caller saved
      $mr19-$mr31 callee saved
    The word below the stack pointer, [$sp-1], is a scratch location
    for the instruction sequences the compiler emits.  */
@@ -143,7 +145,7 @@
 #define CALL_USED_REGISTERS			\
 {						\
   1, 1,						\
-  1, 1, 1, 1, 1, 1, 1, 1,			\
+  1, 1, 1, 1, 1, 1, 0, 1,			\
   1, 1, 1, 1, 1, 1, 1, 1,			\
   1, 1, 1, 0, 0, 0, 0, 0,			\
   0, 0, 0, 0, 0, 0, 0, 0,			\
@@ -153,8 +155,8 @@
 #define REG_ALLOC_ORDER						\
 {								\
   0, 1,								\
-  8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,		\
-  21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,		\
+  9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,		\
+  21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 8,	\
   2, 3, 4, 5, 6, 7, 34, 35, 36, 37				\
 }
 
@@ -166,6 +168,7 @@ enum reg_class
   R_REGS,
   MR_REGS,
   BASE_REGS,
+  FP_BASE_REGS,
   GENERAL_REGS,
   ALL_REGS,
   LIM_REG_CLASSES
@@ -175,7 +178,7 @@ enum reg_class
 
 #define REG_CLASS_NAMES \
 { "NO_REGS", "R0_REGS", "SP_REGS", "R_REGS", "MR_REGS", "BASE_REGS",	\
-  "GENERAL_REGS", "ALL_REGS" }
+  "FP_BASE_REGS", "GENERAL_REGS", "ALL_REGS" }
 
 #define REG_CLASS_CONTENTS			\
 {						\
@@ -185,6 +188,7 @@ enum reg_class
   { 0x00000003, 0x00000000 },	/* R_REGS */	\
   { 0xfffffffc, 0x00000003 },	/* MR_REGS */	\
   { 0x00000001, 0x00000034 },	/* BASE_REGS: $r0, $sp, ?ap, ?fp */ \
+  { 0x00000101, 0x00000034 },	/* FP_BASE_REGS: + $mr6 */	\
   { 0xffffffff, 0x00000033 },	/* GENERAL_REGS: + ?ap, ?fp */ \
   { 0xffffffff, 0x0000003f }	/* ALL_REGS */	\
 }
@@ -196,18 +200,16 @@ enum reg_class
    : (REGNO) == SP_REGNUM ? SP_REGS			\
    : (REGNO) == PC_REGNUM ? ALL_REGS : GENERAL_REGS)
 
-#define BASE_REG_CLASS BASE_REGS
+/* $mr6 is a base register only as the frame pointer, which isn't
+   allocatable then.  */
+#define BASE_REG_CLASS (frame_pointer_needed ? FP_BASE_REGS : BASE_REGS)
 #define INDEX_REG_CLASS NO_REGS
 
 #define TDM_BASE_REGNO_P(REGNO)					\
   ((REGNO) == R0_REGNUM || (REGNO) == SP_REGNUM			\
    || (REGNO) == AP_REGNUM || (REGNO) == FP_REGNUM)
 
-#define REGNO_OK_FOR_BASE_P(REGNO)					\
-  (TDM_BASE_REGNO_P (REGNO)						\
-   || (reg_renumber && (REGNO) >= FIRST_PSEUDO_REGISTER			\
-       && reg_renumber[REGNO] >= 0					\
-       && TDM_BASE_REGNO_P ((unsigned) reg_renumber[REGNO])))
+#define REGNO_OK_FOR_BASE_P(REGNO) tdm_regno_ok_for_base_p (REGNO)
 
 #define REGNO_OK_FOR_INDEX_P(REGNO) 0
 
@@ -218,7 +220,10 @@ enum reg_class
    Stack arguments follow it.  A function that needs a frame lowers $sp
    by its size; from $sp up the frame holds a free word (where calls
    store the return address), the outgoing arguments, the saved
-   registers and the local variables.  */
+   registers and the local variables.  A function that needs a frame
+   pointer (for alloca, variable-sized objects or a nonlocal label)
+   copies $sp to $mr6 after saving the registers, and addresses the
+   frame from $mr6; dynamic allocations lower $sp further.  */
 
 #define STACK_GROWS_DOWNWARD 1
 #define FRAME_GROWS_DOWNWARD 0
@@ -229,13 +234,19 @@ enum reg_class
 
 #define STACK_POINTER_REGNUM SP_REGNUM
 #define FRAME_POINTER_REGNUM FP_REGNUM
-#define HARD_FRAME_POINTER_REGNUM FP_REGNUM
+#define HARD_FRAME_POINTER_REGNUM (MR0_REGNUM + 6)
+/* A nonlocal goto passes its label, frame pointer and $sp in these.  */
+#define TDM_GOTO_LABEL_REGNUM (MR0_REGNUM + 7)
+#define TDM_GOTO_FP_REGNUM (MR0_REGNUM + 8)
+#define TDM_GOTO_SP_REGNUM (MR0_REGNUM + 9)
 #define ARG_POINTER_REGNUM AP_REGNUM
 #define STATIC_CHAIN_REGNUM (MR0_REGNUM + 18)
 
-#define ELIMINABLE_REGS				\
-{ { ARG_POINTER_REGNUM, STACK_POINTER_REGNUM },	\
-  { FRAME_POINTER_REGNUM, STACK_POINTER_REGNUM } }
+#define ELIMINABLE_REGS					\
+{ { ARG_POINTER_REGNUM, STACK_POINTER_REGNUM },		\
+  { ARG_POINTER_REGNUM, HARD_FRAME_POINTER_REGNUM },	\
+  { FRAME_POINTER_REGNUM, STACK_POINTER_REGNUM },		\
+  { FRAME_POINTER_REGNUM, HARD_FRAME_POINTER_REGNUM } }
 
 #define INITIAL_ELIMINATION_OFFSET(FROM, TO, OFFSET) \
   ((OFFSET) = tdm_initial_elimination_offset ((FROM), (TO)))
