@@ -70,7 +70,9 @@ enum tdm_loc_kind
 {
   LOC_R0, LOC_R1, LOC_SP, LOC_PC,	/* Registers.  */
   LOC_MR,				/* $mrN.  */
+  LOC_FP,				/* $mr6 as the frame pointer.  */
   LOC_SPMEM, LOC_ABSMEM, LOC_R0MEM,	/* Memory words.  */
+  LOC_FPMEM,				/* A word addressed through $mr6.  */
   LOC_SCRATCH,				/* [$sp-1].  */
   LOC_R0SAVE,				/* [$sp], holding $r0.  */
   LOC_IMM, LOC_SYM			/* Constants.  */
@@ -137,6 +139,10 @@ tdm_classify (rtx x)
 	  return tdm_make_loc (LOC_SP);
 	case PC_REGNUM:
 	  return tdm_make_loc (LOC_PC);
+	case HARD_FRAME_POINTER_REGNUM:
+	  if (frame_pointer_needed)
+	    return tdm_make_loc (LOC_FP);
+	  /* Fall through.  */
 	default:
 	  gcc_assert (TDM_MR_P (REGNO (x)));
 	  return tdm_make_loc (LOC_MR, REGNO (x) - MR0_REGNUM);
@@ -157,6 +163,9 @@ tdm_classify (rtx x)
 	  l = tdm_make_loc (LOC_ABSMEM, INTVAL (addr) + off);
 	else if (REG_P (addr) && REGNO (addr) == SP_REGNUM)
 	  l = tdm_make_loc (LOC_SPMEM, off);
+	else if (REG_P (addr) && REGNO (addr) == HARD_FRAME_POINTER_REGNUM
+		 && frame_pointer_needed)
+	  l = tdm_make_loc (LOC_FPMEM, off);
 	else if (REG_P (addr) && REGNO (addr) == R0_REGNUM)
 	  {
 	    l = tdm_make_loc (LOC_R0MEM, off);
@@ -196,7 +205,7 @@ static bool
 tdm_mem_loc_p (const tdm_loc &l)
 {
   return (l.kind == LOC_SPMEM || l.kind == LOC_ABSMEM
-	  || l.kind == LOC_R0MEM);
+	  || l.kind == LOC_R0MEM || l.kind == LOC_FPMEM);
 }
 
 /* Memory addressed through a byte pointer in $r0, which an access
@@ -208,12 +217,15 @@ tdm_wrap_p (const tdm_loc &l)
   return l.kind == LOC_R0MEM && !l.word;
 }
 
-/* A stack slot beyond the reach of an [$sp+IMM] operand.  */
+/* A stack slot beyond the reach of an [$sp+IMM] operand, or one
+   addressed through the frame pointer: memory words that need $r0 as
+   their base.  */
 
 static bool
 tdm_far_p (const tdm_loc &l)
 {
-  return l.kind == LOC_SPMEM && !IN_RANGE (l.n, -32, 31);
+  return ((l.kind == LOC_SPMEM && !IN_RANGE (l.n, -32, 31))
+	  || l.kind == LOC_FPMEM);
 }
 
 static bool
@@ -400,20 +412,25 @@ tdm_emit_to_reg (const char *op, const tdm_loc &d, const tdm_loc &s)
       break;
 
     case LOC_SP:
-      /* The byte address in $sp is twice its value.  */
-      if (mov)
-	{
-	  tdm_emit ("mov\t%s, $sp", dn);
-	  tdm_emit ("add\t%s, $sp", dn);
-	}
-      else if (strcmp (op, "add") == 0 || strcmp (op, "sub") == 0)
-	{
-	  tdm_emit ("%s\t%s, $sp", op, dn);
-	  tdm_emit ("%s\t%s, $sp", op, dn);
-	}
-      else
-	tdm_sorry ("logical operation on the stack pointer");
-      return;
+    case LOC_FP:
+      {
+	/* The byte address in $sp (or the frame pointer) is twice its
+	   value.  */
+	const char *sn = s.kind == LOC_SP ? "$sp" : "$mr6";
+	if (mov)
+	  {
+	    tdm_emit ("mov\t%s, %s", dn, sn);
+	    tdm_emit ("add\t%s, %s", dn, sn);
+	  }
+	else if (strcmp (op, "add") == 0 || strcmp (op, "sub") == 0)
+	  {
+	    tdm_emit ("%s\t%s, %s", op, dn, sn);
+	    tdm_emit ("%s\t%s, %s", op, dn, sn);
+	  }
+	else
+	  tdm_sorry ("logical operation on the stack pointer");
+	return;
+      }
 
     case LOC_R0MEM:
       if (s.word)
@@ -529,6 +546,27 @@ tdm_emit_op (const char *op, const tdm_loc &d, const tdm_loc &s)
 	  tdm_emit ("mov\t[$sp-1], $r1");
 	  tdm_emit ("rol\t$r1");
 	  tdm_emit ("mov\t$sp, [$sp-1]");
+	}
+      break;
+
+    case LOC_FP:
+      /* Only moves; halve the value.  $sp is a word address already.  */
+      gcc_assert (strcmp (op, "mov") == 0);
+      if (s.kind == LOC_SP)
+	tdm_emit ("mov\t$mr6, $sp");
+      else if (tdm_reg_loc_p (s))
+	{
+	  tdm_emit ("ror\t%s", tdm_reg_text (s));
+	  tdm_emit ("mov\t$mr6, %s", tdm_reg_text (s));
+	  tdm_emit ("rol\t%s", tdm_reg_text (s));
+	}
+      else
+	{
+	  tdm_emit ("mov\t[$sp-1], $r1");
+	  tdm_emit_to_reg ("mov", tdm_r1, s);
+	  tdm_emit ("ror\t$r1");
+	  tdm_emit ("mov\t$mr6, $r1");
+	  tdm_emit ("mov\t$r1, [$sp-1]");
 	}
       break;
 
@@ -695,8 +733,8 @@ tdm_emit_movqi (const tdm_loc &d, const tdm_loc &s)
     tdm_emit_op ("mov", d, s);
 }
 
-/* Stack slots beyond [$sp+31] are reached through $r0, loaded with
-   their word address.  $r0 itself is kept in [$sp], the free word at
+/* Stack slots beyond [$sp+31], and those addressed through the frame
+   pointer, are reached through $r0, loaded with their word address.  $r0 itself is kept in [$sp], the free word at
    the bottom of the frame, and operands in $r0 are taken from there;
    the constraints keep accesses through a byte pointer in $r0 out of
    such instructions.  When LOAD, D is only written, after S has been
@@ -713,7 +751,7 @@ tdm_far_begin (tdm_loc *d, tdm_loc *s, bool load)
 
   if (!f)
     return false;
-  gcc_assert (f->n > 0
+  gcc_assert ((f->kind == LOC_FPMEM || f->n > 0)
 	      && !(f == s && tdm_far_p (*d))
 	      && d->kind != LOC_R0MEM && !(s && s->kind == LOC_R0MEM));
 
@@ -727,9 +765,17 @@ tdm_far_begin (tdm_loc *d, tdm_loc *s, bool load)
 	*s = tdm_make_loc (LOC_R0SAVE);
     }
 
-  n = f->n - 31;
-  tdm_emit ("mov\t$r0, $sp+31");
-  if (n > 31)
+  if (f->kind == LOC_FPMEM)
+    {
+      n = f->n;
+      tdm_emit ("mov\t$r0, $mr6");
+    }
+  else
+    {
+      n = f->n - 31;
+      tdm_emit ("mov\t$r0, $sp+31");
+    }
+  if (!IN_RANGE (n, -32, 31))
     {
       tdm_emit_to_reg ("add", r0, tdm_make_loc (LOC_IMM, tdm_sext16 (n)));
       n = 0;
@@ -745,6 +791,23 @@ tdm_far_end (bool saved)
 {
   if (saved)
     tdm_emit ("mov\t$r0, [$sp]");
+}
+
+/* Save the frame pointer $mr6 to MEM (SAVE) or restore it from there,
+   as the word address it holds.  */
+
+const char *
+tdm_output_raw_fp (rtx mem, bool save)
+{
+  tdm_loc m = tdm_classify (mem);
+  tdm_loc r = tdm_make_loc (LOC_MR, HARD_FRAME_POINTER_REGNUM - MR0_REGNUM);
+  tdm_loc *d = save ? &m : &r;
+  tdm_loc *s = save ? &r : &m;
+  bool saved = tdm_far_begin (d, s, true);
+
+  tdm_emit_op ("mov", *d, *s);
+  tdm_far_end (saved);
+  return "";
 }
 
 const char *
@@ -768,13 +831,28 @@ tdm_output_binop (const char *op, rtx *operands)
   tdm_loc d = tdm_classify (operands[0]);
   tdm_loc s = tdm_classify (operands[2]);
 
-  if (d.kind == LOC_SP)
+  if (d.kind == LOC_SP && CONST_INT_P (operands[2]))
     {
       /* Adjust the stack pointer, in words.  */
       HOST_WIDE_INT words = INTVAL (operands[2]) / 2;
       if (strcmp (op, "sub") == 0)
 	words = -words;
       tdm_emit_to_reg ("add", d, tdm_make_loc (LOC_IMM, tdm_sext16 (words)));
+    }
+  else if (d.kind == LOC_SP)
+    {
+      /* By an (even) octet count in $r0 or $r1, for alloca.  $r1 can't
+	 be OPB: go through the scratch word.  */
+      const char *rn = tdm_reg_text (s);
+      tdm_emit ("ror\t%s", rn);
+      if (s.kind == LOC_R0)
+	tdm_emit ("%s\t$sp, $r0", op);
+      else
+	{
+	  tdm_emit ("mov\t[$sp-1], $r1");
+	  tdm_emit ("%s\t$sp, [$sp-1]", op);
+	}
+      tdm_emit ("rol\t%s", rn);
     }
   else
     {
@@ -1082,6 +1160,24 @@ tdm_cannot_substitute_mem_equiv_p (rtx subst)
 	       || VIRTUAL_REGISTER_NUM_P (REGNO (x))));
 }
 
+/* Expand a nonlocal goto (and __builtin_longjmp): OPERANDS[1] is the
+   target label, OPERANDS[2] the saved $sp and OPERANDS[3] the saved
+   frame pointer, both byte addresses.  They go to fixed memory
+   registers first, as nothing can be reloaded once $sp moves; then a
+   single jump sets $sp and $mr6.  */
+
+void
+tdm_expand_nonlocal_goto (rtx *operands)
+{
+  emit_move_insn (gen_rtx_REG (HImode, TDM_GOTO_LABEL_REGNUM), operands[1]);
+  emit_move_insn (gen_rtx_REG (HImode, TDM_GOTO_FP_REGNUM), operands[3]);
+  emit_move_insn (gen_rtx_REG (HImode, TDM_GOTO_SP_REGNUM), operands[2]);
+  emit_clobber (gen_rtx_MEM (BLKmode, gen_rtx_SCRATCH (VOIDmode)));
+  emit_clobber (gen_rtx_MEM (BLKmode, hard_frame_pointer_rtx));
+  emit_jump_insn (gen_tdm_nonlocal_jump ());
+  emit_barrier ();
+}
+
 /* Make the first N OPERANDS of an insn pairwise acceptable to
    tdm_operand_pair_ok_p by loading inputs into registers.  Operand 0
    is the output.  */
@@ -1113,6 +1209,8 @@ struct tdm_frame_info
 static bool
 tdm_save_reg_p (unsigned int regno)
 {
+  if (regno == HARD_FRAME_POINTER_REGNUM && frame_pointer_needed)
+    return true;
   return (TDM_MR_P (regno) && df_regs_ever_live_p (regno)
 	  && !call_used_or_fixed_reg_p (regno));
 }
@@ -1137,7 +1235,9 @@ tdm_initial_elimination_offset (int from, int to)
 {
   tdm_frame_info f;
 
-  gcc_assert (to == STACK_POINTER_REGNUM);
+  /* The frame pointer is $sp after the prologue.  */
+  gcc_assert (to == STACK_POINTER_REGNUM
+	      || to == HARD_FRAME_POINTER_REGNUM);
   tdm_compute_frame (&f);
   if (from == ARG_POINTER_REGNUM)
     return f.total;
@@ -1180,10 +1280,6 @@ tdm_expand_prologue (void)
   tdm_frame_info f;
   HOST_WIDE_INT off;
 
-  if (frame_pointer_needed)
-    sorry ("functions that need a frame pointer are not supported "
-	   "on TDM yet");
-
   tdm_compute_frame (&f);
   if (f.total)
     tdm_emit_sp_adjust (-f.total);
@@ -1195,13 +1291,30 @@ tdm_expand_prologue (void)
     if (tdm_save_reg_p (regno))
       {
 	rtx reg = gen_rtx_REG (HImode, regno);
-	rtx_insn *insn = emit_move_insn (tdm_save_slot (off, false), reg);
+	rtx slot = tdm_save_slot (off, false);
+	rtx_insn *insn;
 
+	/* The caller's frame pointer is a word address: keep it so.  */
+	if (regno == HARD_FRAME_POINTER_REGNUM && frame_pointer_needed)
+	  insn = emit_insn (gen_tdm_save_fp (slot));
+	else
+	  insn = emit_move_insn (slot, reg);
 	RTX_FRAME_RELATED_P (insn) = 1;
 	add_reg_note (insn, REG_CFA_OFFSET,
 		      gen_rtx_SET (tdm_save_slot (off, true), reg));
 	off += 2;
       }
+
+  if (frame_pointer_needed)
+    {
+      rtx_insn *insn = emit_move_insn (hard_frame_pointer_rtx,
+				       stack_pointer_rtx);
+      RTX_FRAME_RELATED_P (insn) = 1;
+      add_reg_note (insn, REG_CFA_DEF_CFA,
+		    plus_constant (Pmode, hard_frame_pointer_rtx,
+				   f.total / 2));
+      emit_insn (gen_blockage ());
+    }
 }
 
 void
@@ -1211,12 +1324,29 @@ tdm_expand_epilogue (void)
   HOST_WIDE_INT off;
 
   tdm_compute_frame (&f);
+  if (frame_pointer_needed)
+    {
+      /* Drop the dynamic allocations.  */
+      rtx_insn *insn;
+
+      emit_insn (gen_blockage ());
+      insn = emit_insn (gen_tdm_sp_from_fp ());
+      RTX_FRAME_RELATED_P (insn) = 1;
+      add_reg_note (insn, REG_CFA_DEF_CFA,
+		    plus_constant (Pmode, stack_pointer_rtx, f.total / 2));
+    }
   off = 2 + f.outgoing;
   for (unsigned int regno = MR0_REGNUM; regno <= MR31_REGNUM; regno++)
     if (tdm_save_reg_p (regno))
       {
 	rtx reg = gen_rtx_REG (HImode, regno);
-	rtx_insn *insn = emit_move_insn (reg, tdm_save_slot (off, false));
+	rtx slot = tdm_save_slot (off, false);
+	rtx_insn *insn;
+
+	if (regno == HARD_FRAME_POINTER_REGNUM && frame_pointer_needed)
+	  insn = emit_insn (gen_tdm_restore_fp (slot));
+	else
+	  insn = emit_move_insn (reg, slot);
 
 	RTX_FRAME_RELATED_P (insn) = 1;
 	add_reg_note (insn, REG_CFA_RESTORE, reg);
@@ -1272,7 +1402,29 @@ tdm_register_move_cost (machine_mode, reg_class_t from, reg_class_t to)
 static bool
 tdm_can_eliminate (const int, const int to)
 {
-  return to == STACK_POINTER_REGNUM;
+  return to == HARD_FRAME_POINTER_REGNUM || !frame_pointer_needed;
+}
+
+/* Implement TARGET_FRAME_POINTER_REQUIRED.  $sp moves in functions
+   with dynamic allocations, and a nonlocal goto restores the frame
+   pointer of its target.  */
+
+static bool
+tdm_frame_pointer_required (void)
+{
+  return cfun->calls_alloca || cfun->has_nonlocal_label;
+}
+
+/* Implement REGNO_OK_FOR_BASE_P.  */
+
+bool
+tdm_regno_ok_for_base_p (unsigned int regno)
+{
+  if (regno >= FIRST_PSEUDO_REGISTER && reg_renumber
+      && reg_renumber[regno] >= 0)
+    regno = reg_renumber[regno];
+  return (TDM_BASE_REGNO_P (regno)
+	  || (regno == HARD_FRAME_POINTER_REGNUM && frame_pointer_needed));
 }
 
 /* Addresses: $sp or $r0 plus a 6-bit word offset, or an absolute word
@@ -1303,7 +1455,8 @@ tdm_legitimate_address_p (machine_mode mode, rtx x, bool strict,
 
   regno = REGNO (x);
   if (regno == AP_REGNUM || regno == FP_REGNUM
-      || VIRTUAL_REGISTER_NUM_P (regno))
+      || VIRTUAL_REGISTER_NUM_P (regno)
+      || (regno == HARD_FRAME_POINTER_REGNUM && frame_pointer_needed))
     return true;
   if (regno >= FIRST_PSEUDO_REGISTER)
     {
@@ -1557,6 +1710,8 @@ tdm_init_libfuncs (void)
 #define TARGET_CAN_ELIMINATE tdm_can_eliminate
 #undef  TARGET_LEGITIMATE_ADDRESS_P
 #define TARGET_LEGITIMATE_ADDRESS_P tdm_legitimate_address_p
+#undef  TARGET_FRAME_POINTER_REQUIRED
+#define TARGET_FRAME_POINTER_REQUIRED tdm_frame_pointer_required
 #undef  TARGET_CANNOT_SUBSTITUTE_MEM_EQUIV_P
 #define TARGET_CANNOT_SUBSTITUTE_MEM_EQUIV_P tdm_cannot_substitute_mem_equiv_p
 
