@@ -21,6 +21,8 @@ extern void tdm_expand_prologue (void);
 extern void tdm_expand_epilogue (void);
 extern void tdm_expand_cbranch (rtx *);
 extern bool tdm_q_memory_p (rtx);
+extern bool tdm_operand_pair_ok_p (rtx, rtx);
+extern void tdm_fix_operand_pairs (rtx *, int);
 extern int tdm_insn_length (rtx_insn *);
 extern const char *tdm_output_move (rtx *, machine_mode);
 extern const char *tdm_output_binop (const char *, rtx *);

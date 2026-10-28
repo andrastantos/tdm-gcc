@@ -72,6 +72,7 @@ enum tdm_loc_kind
   LOC_MR,				/* $mrN.  */
   LOC_SPMEM, LOC_ABSMEM, LOC_R0MEM,	/* Memory words.  */
   LOC_SCRATCH,				/* [$sp-1].  */
+  LOC_R0SAVE,				/* [$sp], holding $r0.  */
   LOC_IMM, LOC_SYM			/* Constants.  */
 };
 
@@ -84,6 +85,8 @@ struct tdm_loc
   /* QImode memory: the octet is the high one of the word, or unknown
      at compile time.  */
   bool high, dynamic;
+  /* LOC_R0MEM: $r0 holds a word address rather than a byte pointer.  */
+  bool word;
   rtx sym;
 };
 
@@ -196,6 +199,23 @@ tdm_mem_loc_p (const tdm_loc &l)
 	  || l.kind == LOC_R0MEM);
 }
 
+/* Memory addressed through a byte pointer in $r0, which an access
+   rotates right and back.  */
+
+static bool
+tdm_wrap_p (const tdm_loc &l)
+{
+  return l.kind == LOC_R0MEM && !l.word;
+}
+
+/* A stack slot beyond the reach of an [$sp+IMM] operand.  */
+
+static bool
+tdm_far_p (const tdm_loc &l)
+{
+  return l.kind == LOC_SPMEM && !IN_RANGE (l.n, -32, 31);
+}
+
 static bool
 tdm_loc_equal_p (const tdm_loc &a, const tdm_loc &b)
 {
@@ -236,6 +256,7 @@ tdm_opb_text (const tdm_loc &l)
     case LOC_R0: return "$r0";
     case LOC_SP: return "$sp";
     case LOC_SCRATCH: return "[$sp-1]";
+    case LOC_R0SAVE: return "[$sp]";
     case LOC_MR: snprintf (b, 32, "$mr%d", n); break;
     case LOC_SPMEM: snprintf (b, 32, n ? "[$sp%+d]" : "[$sp]", n); break;
     case LOC_R0MEM: snprintf (b, 32, n ? "[$r0%+d]" : "[$r0]", n); break;
@@ -395,6 +416,8 @@ tdm_emit_to_reg (const char *op, const tdm_loc &d, const tdm_loc &s)
       return;
 
     case LOC_R0MEM:
+      if (s.word)
+	break;
       gcc_assert (d.kind != LOC_PC && d.kind != LOC_SP);
       if (d.kind == LOC_R0 && !mov)
 	{
@@ -441,7 +464,7 @@ tdm_emit_to_reg (const char *op, const tdm_loc &d, const tdm_loc &s)
 static void
 tdm_emit_to_mem (const char *op, const tdm_loc &d, const tdm_loc &s)
 {
-  bool wrap = d.kind == LOC_R0MEM;
+  bool wrap = tdm_wrap_p (d);
 
   if (s.kind == LOC_R1 || (s.kind == LOC_R0 && !wrap))
     {
@@ -522,7 +545,7 @@ tdm_emit_rotate (const char *op, const tdm_loc &d)
 {
   if (tdm_reg_loc_p (d))
     tdm_emit ("%s\t%s", op, tdm_reg_text (d));
-  else if (d.kind == LOC_R0MEM)
+  else if (tdm_wrap_p (d))
     {
       tdm_emit ("ror\t$r0");
       tdm_emit ("%s\t%s", op, tdm_opb_text (d));
@@ -644,7 +667,7 @@ tdm_emit_movqi (const tdm_loc &d, const tdm_loc &s)
     }
   else if (tdm_mem_loc_p (d))
     {
-      bool wrap = d.kind == LOC_R0MEM;
+      bool wrap = tdm_wrap_p (d);
       tdm_loc w = d;
 
       if (d.dynamic)
@@ -672,16 +695,70 @@ tdm_emit_movqi (const tdm_loc &d, const tdm_loc &s)
     tdm_emit_op ("mov", d, s);
 }
 
+/* Stack slots beyond [$sp+31] are reached through $r0, loaded with
+   their word address.  $r0 itself is kept in [$sp], the free word at
+   the bottom of the frame, and operands in $r0 are taken from there;
+   the constraints keep accesses through a byte pointer in $r0 out of
+   such instructions.  When LOAD, D is only written, after S has been
+   read, so a destination $r0 needs no saving.  Return whether $r0 was
+   saved, for tdm_far_end.  */
+
+static bool
+tdm_far_begin (tdm_loc *d, tdm_loc *s, bool load)
+{
+  tdm_loc r0 = tdm_make_loc (LOC_R0);
+  tdm_loc *f = tdm_far_p (*d) ? d : s && tdm_far_p (*s) ? s : NULL;
+  bool save;
+  HOST_WIDE_INT n;
+
+  if (!f)
+    return false;
+  gcc_assert (f->n > 0
+	      && !(f == s && tdm_far_p (*d))
+	      && d->kind != LOC_R0MEM && !(s && s->kind == LOC_R0MEM));
+
+  save = !(load && d->kind == LOC_R0);
+  if (save)
+    {
+      tdm_emit ("mov\t[$sp], $r0");
+      if (d->kind == LOC_R0)
+	*d = tdm_make_loc (LOC_R0SAVE);
+      if (s && s->kind == LOC_R0)
+	*s = tdm_make_loc (LOC_R0SAVE);
+    }
+
+  n = f->n - 31;
+  tdm_emit ("mov\t$r0, $sp+31");
+  if (n > 31)
+    {
+      tdm_emit_to_reg ("add", r0, tdm_make_loc (LOC_IMM, tdm_sext16 (n)));
+      n = 0;
+    }
+  f->kind = LOC_R0MEM;
+  f->n = n;
+  f->word = true;
+  return save;
+}
+
+static void
+tdm_far_end (bool saved)
+{
+  if (saved)
+    tdm_emit ("mov\t$r0, [$sp]");
+}
+
 const char *
 tdm_output_move (rtx *operands, machine_mode mode)
 {
   tdm_loc d = tdm_classify (operands[0]);
   tdm_loc s = tdm_classify (operands[1]);
+  bool saved = tdm_far_begin (&d, &s, true);
 
   if (mode == QImode)
     tdm_emit_movqi (d, s);
   else
     tdm_emit_op ("mov", d, s);
+  tdm_far_end (saved);
   return "";
 }
 
@@ -700,7 +777,11 @@ tdm_output_binop (const char *op, rtx *operands)
       tdm_emit_to_reg ("add", d, tdm_make_loc (LOC_IMM, tdm_sext16 (words)));
     }
   else
-    tdm_emit_op (op, d, s);
+    {
+      bool saved = tdm_far_begin (&d, &s, false);
+      tdm_emit_op (op, d, s);
+      tdm_far_end (saved);
+    }
   return "";
 }
 
@@ -710,12 +791,13 @@ tdm_output_unop (enum rtx_code code, rtx *operands)
   tdm_loc d = tdm_classify (operands[0]);
   const char *insn = code == NEG ? "isub" : "xor";
   int imm = code == NEG ? 0 : -1;
+  bool saved = tdm_far_begin (&d, NULL, false);
 
   if (tdm_reg_loc_p (d))
     tdm_emit ("%s\t%s, %d", insn, tdm_reg_text (d), imm);
   else
     {
-      bool wrap = d.kind == LOC_R0MEM;
+      bool wrap = tdm_wrap_p (d);
       if (wrap)
 	tdm_emit ("ror\t$r0");
       tdm_emit ("swap\t$r1, %s", tdm_opb_text (d));
@@ -724,6 +806,7 @@ tdm_output_unop (enum rtx_code code, rtx *operands)
       if (wrap)
 	tdm_emit ("rol\t$r0");
     }
+  tdm_far_end (saved);
   return "";
 }
 
@@ -736,9 +819,11 @@ tdm_output_shift (enum rtx_code code, rtx *operands)
   int n = INTVAL (operands[2]) & 15;
   bool left = code == ASHIFT;
   HOST_WIDE_INT mask;
+  bool saved;
 
   if (n == 0)
     return "";
+  saved = tdm_far_begin (&d, NULL, false);
   if (n <= 8)
     for (int i = 0; i < n; i++)
       tdm_emit_rotate (left ? "rol" : "ror", d);
@@ -754,6 +839,7 @@ tdm_output_shift (enum rtx_code code, rtx *operands)
       tdm_emit_op ("xor", d, m);
       tdm_emit_op ("sub", d, m);
     }
+  tdm_far_end (saved);
   return "";
 }
 
@@ -762,6 +848,7 @@ tdm_output_extend (enum rtx_code code, rtx *operands)
 {
   tdm_loc d = tdm_classify (operands[0]);
   tdm_loc s = tdm_classify (operands[1]);
+  bool saved = tdm_far_begin (&d, &s, true);
 
   if (tdm_mem_loc_p (s))
     tdm_emit_movqi (d, s);
@@ -776,6 +863,7 @@ tdm_output_extend (enum rtx_code code, rtx *operands)
       tdm_emit_op ("xor", d, m);
       tdm_emit_op ("sub", d, m);
     }
+  tdm_far_end (saved);
   return "";
 }
 
@@ -808,7 +896,7 @@ tdm_output_cbranch (rtx *operands, rtx_insn *insn)
   bool far = get_attr_length (insn) > 6;
   char lab[32];
 
-  gcc_assert (tdm_reg_loc_p (a) && b.kind != LOC_R0MEM);
+  gcc_assert (tdm_reg_loc_p (a) && b.kind != LOC_R0MEM && !tdm_far_p (b));
   if (b.kind == LOC_R1)
     {
       tdm_emit ("mov\t[$sp-1], $r1");
@@ -930,23 +1018,84 @@ tdm_expand_cbranch (rtx *operands)
 }
 
 /* Memory not addressed through $r0, which can't be rotated around a
-   predicate or a jump.  */
+   predicate or a jump: an absolute address, or a stack slot.  Stack
+   slots beyond [$sp+31] need $r0 too (see tdm_far_begin), so they only
+   qualify while their offset isn't known.  */
 
 bool
 tdm_q_memory_p (rtx op)
 {
   rtx x;
+  HOST_WIDE_INT off = 0;
 
   if (!MEM_P (op))
     return false;
   x = XEXP (op, 0);
-  if (GET_CODE (x) == PLUS)
-    x = XEXP (x, 0);
+  if (GET_CODE (x) == PLUS && CONST_INT_P (XEXP (x, 1)))
+    {
+      off = INTVAL (XEXP (x, 1));
+      x = XEXP (x, 0);
+    }
   if (CONST_INT_P (x))
     return true;
-  return (REG_P (x)
-	  && (REGNO (x) == SP_REGNUM || REGNO (x) == AP_REGNUM
-	      || REGNO (x) == FP_REGNUM));
+  if (!REG_P (x))
+    return false;
+  if (REGNO (x) == AP_REGNUM || REGNO (x) == FP_REGNUM
+      || VIRTUAL_REGISTER_NUM_P (REGNO (x)))
+    return true;
+  return (REGNO (x) == SP_REGNUM
+	  && (off + GET_MODE_SIZE (GET_MODE (op)) - 1) >> 1 <= 31);
+}
+
+/* Whether an instruction can have both A and B as operands: they
+   mustn't both be memory that is addressed through $r0, the only base
+   register for pointers.  The constraints sort this out in register
+   allocation; this keeps the passes before it from combining such
+   operands.  */
+
+bool
+tdm_operand_pair_ok_p (rtx a, rtx b)
+{
+  return !(MEM_P (a) && MEM_P (b)
+	   && !tdm_q_memory_p (a) && !tdm_q_memory_p (b));
+}
+
+/* Implement TARGET_CANNOT_SUBSTITUTE_MEM_EQUIV_P.  Memory addressed
+   through a pointer needs $r0, so substituting it for a register could
+   leave an instruction needing $r0 twice.  */
+
+static bool
+tdm_cannot_substitute_mem_equiv_p (rtx subst)
+{
+  rtx x;
+
+  if (!MEM_P (subst))
+    return false;
+  x = XEXP (subst, 0);
+  if (GET_CODE (x) == PLUS && CONST_INT_P (XEXP (x, 1)))
+    x = XEXP (x, 0);
+  if (CONST_INT_P (x))
+    return false;
+  return !(REG_P (x)
+	   && (REGNO (x) == SP_REGNUM || REGNO (x) == AP_REGNUM
+	       || REGNO (x) == FP_REGNUM
+	       || VIRTUAL_REGISTER_NUM_P (REGNO (x))));
+}
+
+/* Make the first N OPERANDS of an insn pairwise acceptable to
+   tdm_operand_pair_ok_p by loading inputs into registers.  Operand 0
+   is the output.  */
+
+void
+tdm_fix_operand_pairs (rtx *operands, int n)
+{
+  for (int i = n - 1; i > 0; i--)
+    for (int j = 0; j < i; j++)
+      if (!tdm_operand_pair_ok_p (operands[j], operands[i]))
+	{
+	  operands[i] = force_reg (GET_MODE (operands[0]), operands[i]);
+	  break;
+	}
 }
 
 /* Frame layout, from $sp up: a free word, the outgoing arguments, the
@@ -1153,16 +1302,19 @@ tdm_legitimate_address_p (machine_mode mode, rtx x, bool strict,
     return false;
 
   regno = REGNO (x);
-  if (regno == AP_REGNUM || regno == FP_REGNUM)
+  if (regno == AP_REGNUM || regno == FP_REGNUM
+      || VIRTUAL_REGISTER_NUM_P (regno))
     return true;
   if (regno >= FIRST_PSEUDO_REGISTER)
     {
       if (strict)
 	return false;
     }
-  else if (regno != SP_REGNUM && regno != R0_REGNUM)
+  else if (regno == SP_REGNUM)
+    return true;
+  else if (regno != R0_REGNUM)
     return false;
-  if (regno != SP_REGNUM && (off & 1) != 0)
+  if ((off & 1) != 0)
     return false;
   return off >> 1 >= -32 && (off + size - 1) >> 1 <= 31;
 }
@@ -1405,6 +1557,8 @@ tdm_init_libfuncs (void)
 #define TARGET_CAN_ELIMINATE tdm_can_eliminate
 #undef  TARGET_LEGITIMATE_ADDRESS_P
 #define TARGET_LEGITIMATE_ADDRESS_P tdm_legitimate_address_p
+#undef  TARGET_CANNOT_SUBSTITUTE_MEM_EQUIV_P
+#define TARGET_CANNOT_SUBSTITUTE_MEM_EQUIV_P tdm_cannot_substitute_mem_equiv_p
 
 #undef  TARGET_PROMOTE_PROTOTYPES
 #define TARGET_PROMOTE_PROTOTYPES hook_bool_const_tree_true

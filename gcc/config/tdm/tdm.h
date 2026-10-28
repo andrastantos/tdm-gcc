@@ -240,6 +240,10 @@ enum reg_class
 #define INITIAL_ELIMINATION_OFFSET(FROM, TO, OFFSET) \
   ((OFFSET) = tdm_initial_elimination_offset ((FROM), (TO)))
 
+/* There is no frame chain to walk, so __builtin_frame_address (0)
+   needn't keep a hard frame pointer: the eliminable one will do.  */
+#define INITIAL_FRAME_ADDRESS_RTX frame_pointer_rtx
+
 /* Arguments: the first one in $r0 if it fits in a word, the others on
    the stack.  Results of up to 32 bits come back in $r0 (and $r1).  */
 

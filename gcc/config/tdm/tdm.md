@@ -55,9 +55,9 @@
 })
 
 (define_insn "*movhi"
-  [(set (match_operand:HI 0 "nonimmediate_operand" "=rm,r,k")
-	(match_operand:HI 1 "general_operand" "rmi,k,q"))]
-  ""
+  [(set (match_operand:HI 0 "nonimmediate_operand" "=r,m,Q,r,k")
+	(match_operand:HI 1 "general_operand" "rmi,rQi,m,k,q"))]
+  "tdm_operand_pair_ok_p (operands[0], operands[1])"
   "* return tdm_output_move (operands, HImode);")
 
 (define_expand "movqi"
@@ -73,7 +73,7 @@
 (define_insn "*movqi"
   [(set (match_operand:QI 0 "nonimmediate_operand" "=r,m")
 	(match_operand:QI 1 "general_operand" "rmi,ri"))]
-  ""
+  "tdm_operand_pair_ok_p (operands[0], operands[1])"
   "* return tdm_output_move (operands, QImode);")
 
 (define_insn "zero_extendqihi2"
@@ -92,51 +92,84 @@
 ;; Arithmetic and logic
 ;; -------------------------------------------------------------------
 
-(define_insn "addhi3"
-  [(set (match_operand:HI 0 "nonimmediate_operand" "=rm,k")
-	(plus:HI (match_operand:HI 1 "nonimmediate_operand" "%0,0")
-		 (match_operand:HI 2 "general_operand" "rmi,n")))]
+;; The insns don't take two memory operands addressed through pointers
+;; (see tdm_operand_pair_ok_p); the expanders load one into a register.
+
+(define_code_iterator arith_op [plus minus and ior xor])
+(define_code_attr arith_name [(plus "add") (minus "sub") (and "and")
+			      (ior "ior") (xor "xor")])
+
+(define_expand "<arith_name>hi3"
+  [(set (match_operand:HI 0 "nonimmediate_operand")
+	(arith_op:HI (match_operand:HI 1 "nonimmediate_operand")
+		     (match_operand:HI 2 "general_operand")))]
   ""
+  "tdm_fix_operand_pairs (operands, 3);")
+
+(define_code_iterator unary_op [neg not])
+(define_code_attr unary_name [(neg "neg") (not "one_cmpl")])
+
+(define_expand "<unary_name>hi2"
+  [(set (match_operand:HI 0 "nonimmediate_operand")
+	(unary_op:HI (match_operand:HI 1 "nonimmediate_operand")))]
+  ""
+  "tdm_fix_operand_pairs (operands, 2);")
+
+(define_insn "*addhi3"
+  [(set (match_operand:HI 0 "nonimmediate_operand" "=r,m,Q,k")
+	(plus:HI (match_operand:HI 1 "nonimmediate_operand" "%0,0,0,0")
+		 (match_operand:HI 2 "general_operand" "rmi,rQi,m,n")))]
+  "tdm_operand_pair_ok_p (operands[0], operands[1])
+   && tdm_operand_pair_ok_p (operands[0], operands[2])
+   && tdm_operand_pair_ok_p (operands[1], operands[2])"
   "* return tdm_output_binop (\"add\", operands);")
 
-(define_insn "subhi3"
-  [(set (match_operand:HI 0 "nonimmediate_operand" "=rm,k")
-	(minus:HI (match_operand:HI 1 "nonimmediate_operand" "0,0")
-		  (match_operand:HI 2 "general_operand" "rmi,n")))]
-  ""
+(define_insn "*subhi3"
+  [(set (match_operand:HI 0 "nonimmediate_operand" "=r,m,Q,k")
+	(minus:HI (match_operand:HI 1 "nonimmediate_operand" "0,0,0,0")
+		  (match_operand:HI 2 "general_operand" "rmi,rQi,m,n")))]
+  "tdm_operand_pair_ok_p (operands[0], operands[1])
+   && tdm_operand_pair_ok_p (operands[0], operands[2])
+   && tdm_operand_pair_ok_p (operands[1], operands[2])"
   "* return tdm_output_binop (\"sub\", operands);")
 
-(define_insn "andhi3"
-  [(set (match_operand:HI 0 "nonimmediate_operand" "=rm")
-	(and:HI (match_operand:HI 1 "nonimmediate_operand" "%0")
-		(match_operand:HI 2 "general_operand" "rmi")))]
-  ""
+(define_insn "*andhi3"
+  [(set (match_operand:HI 0 "nonimmediate_operand" "=r,m,Q")
+	(and:HI (match_operand:HI 1 "nonimmediate_operand" "%0,0,0")
+		(match_operand:HI 2 "general_operand" "rmi,rQi,m")))]
+  "tdm_operand_pair_ok_p (operands[0], operands[1])
+   && tdm_operand_pair_ok_p (operands[0], operands[2])
+   && tdm_operand_pair_ok_p (operands[1], operands[2])"
   "* return tdm_output_binop (\"and\", operands);")
 
-(define_insn "iorhi3"
-  [(set (match_operand:HI 0 "nonimmediate_operand" "=rm")
-	(ior:HI (match_operand:HI 1 "nonimmediate_operand" "%0")
-		(match_operand:HI 2 "general_operand" "rmi")))]
-  ""
+(define_insn "*iorhi3"
+  [(set (match_operand:HI 0 "nonimmediate_operand" "=r,m,Q")
+	(ior:HI (match_operand:HI 1 "nonimmediate_operand" "%0,0,0")
+		(match_operand:HI 2 "general_operand" "rmi,rQi,m")))]
+  "tdm_operand_pair_ok_p (operands[0], operands[1])
+   && tdm_operand_pair_ok_p (operands[0], operands[2])
+   && tdm_operand_pair_ok_p (operands[1], operands[2])"
   "* return tdm_output_binop (\"or\", operands);")
 
-(define_insn "xorhi3"
-  [(set (match_operand:HI 0 "nonimmediate_operand" "=rm")
-	(xor:HI (match_operand:HI 1 "nonimmediate_operand" "%0")
-		(match_operand:HI 2 "general_operand" "rmi")))]
-  ""
+(define_insn "*xorhi3"
+  [(set (match_operand:HI 0 "nonimmediate_operand" "=r,m,Q")
+	(xor:HI (match_operand:HI 1 "nonimmediate_operand" "%0,0,0")
+		(match_operand:HI 2 "general_operand" "rmi,rQi,m")))]
+  "tdm_operand_pair_ok_p (operands[0], operands[1])
+   && tdm_operand_pair_ok_p (operands[0], operands[2])
+   && tdm_operand_pair_ok_p (operands[1], operands[2])"
   "* return tdm_output_binop (\"xor\", operands);")
 
-(define_insn "neghi2"
+(define_insn "*neghi2"
   [(set (match_operand:HI 0 "nonimmediate_operand" "=rm")
 	(neg:HI (match_operand:HI 1 "nonimmediate_operand" "0")))]
-  ""
+  "tdm_operand_pair_ok_p (operands[0], operands[1])"
   "* return tdm_output_unop (NEG, operands);")
 
-(define_insn "one_cmplhi2"
+(define_insn "*one_cmplhi2"
   [(set (match_operand:HI 0 "nonimmediate_operand" "=rm")
 	(not:HI (match_operand:HI 1 "nonimmediate_operand" "0")))]
-  ""
+  "tdm_operand_pair_ok_p (operands[0], operands[1])"
   "* return tdm_output_unop (NOT, operands);")
 
 ;; Shifts by a constant are rotates and a mask; other shifts are
@@ -154,13 +187,14 @@
 {
   if (!CONST_INT_P (operands[2]))
     FAIL;
+  tdm_fix_operand_pairs (operands, 2);
 })
 
 (define_insn "*<shift_insn>hi3"
   [(set (match_operand:HI 0 "nonimmediate_operand" "=rm")
 	(any_shift:HI (match_operand:HI 1 "nonimmediate_operand" "0")
 		      (match_operand:HI 2 "const_int_operand" "n")))]
-  ""
+  "tdm_operand_pair_ok_p (operands[0], operands[1])"
   "* return tdm_output_shift (<CODE>, operands);")
 
 ;; -------------------------------------------------------------------
