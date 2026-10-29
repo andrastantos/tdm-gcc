@@ -760,8 +760,7 @@ tdm_far_begin (tdm_loc *d, tdm_loc *s, bool load)
 
   if (!f)
     return false;
-  gcc_assert ((f->kind == LOC_FPMEM || f->n > 0)
-	      && !(f == s && tdm_far_p (*d))
+  gcc_assert (!(f == s && tdm_far_p (*d))
 	      && d->kind != LOC_R0MEM && !(s && s->kind == LOC_R0MEM));
 
   save = !(load && d->kind == LOC_R0);
@@ -779,10 +778,16 @@ tdm_far_begin (tdm_loc *d, tdm_loc *s, bool load)
       n = f->n;
       tdm_emit ("mov\t$r0, $mr6");
     }
-  else
+  else if (f->n > 0)
     {
       n = f->n - 31;
       tdm_emit ("mov\t$r0, $sp+31");
+    }
+  else
+    {
+      /* Below $sp: only out of bounds accesses get there.  */
+      n = f->n + 32;
+      tdm_emit ("mov\t$r0, $sp-32");
     }
   if (!IN_RANGE (n, -32, 31))
     {
