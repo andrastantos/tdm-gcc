@@ -21,3 +21,17 @@
 muser-mode
 Target Mask(USER_MODE)
 Generate code for user mode, where $mr0-$mr2 are available as registers.
+
+mlayout=
+Target RejectNegative Joined Enum(tdm_layout) Var(tdm_layout) Init(0)
+Link for this memory layout: shared (code and data together below word 0x8000, the default) or largemem (data below 0x8000, code above it).
+
+Enum
+Name(tdm_layout) Type(int)
+Memory layouts for -mlayout=:
+
+EnumValue
+Enum(tdm_layout) String(shared) Value(0)
+
+EnumValue
+Enum(tdm_layout) String(largemem) Value(1)
