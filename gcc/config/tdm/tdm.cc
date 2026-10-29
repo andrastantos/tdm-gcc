@@ -20,12 +20,14 @@
 #define IN_TARGET_CODE 1
 
 #include "config.h"
+#define INCLUDE_STRING
 #include "system.h"
 #include "coretypes.h"
 #include "backend.h"
 #include "target.h"
 #include "rtl.h"
 #include "tree.h"
+#include "fold-const.h"
 #include "stringpool.h"
 #include "attribs.h"
 #include "df.h"
@@ -988,8 +990,23 @@ tdm_output_cbranch (rtx *operands, rtx_insn *insn)
   bool far = get_attr_length (insn) > 6;
   char lab[32];
 
-  gcc_assert (tdm_reg_loc_p (a) && b.kind != LOC_R0MEM && !tdm_far_p (b));
-  if (b.kind == LOC_R1)
+  gcc_assert (tdm_reg_loc_p (a));
+  if (tdm_wrap_p (b) || tdm_far_p (b))
+    {
+      /* The second alternative: put B in the scratch word, by way of
+	 $r1, which holds A.  */
+      tdm_loc r1 = tdm_r1;
+      bool saved;
+
+      gcc_assert (a.kind == LOC_R1);
+      tdm_emit ("swap\t$r1, [$sp-1]");
+      saved = tdm_far_begin (&r1, &b, true);
+      tdm_emit_to_reg ("mov", r1, b);
+      tdm_far_end (saved);
+      tdm_emit ("swap\t$r1, [$sp-1]");
+      b = tdm_make_loc (LOC_SCRATCH);
+    }
+  else if (b.kind == LOC_R1)
     {
       tdm_emit ("mov\t[$sp-1], $r1");
       b = tdm_make_loc (LOC_SCRATCH);
@@ -1143,13 +1160,100 @@ tdm_q_memory_p (rtx op)
    mustn't both be memory that is addressed through $r0, the only base
    register for pointers.  The constraints sort this out in register
    allocation; this keeps the passes before it from combining such
-   operands.  */
+   operands.  Memory can also come inside a SUBREG.  */
 
 bool
 tdm_operand_pair_ok_p (rtx a, rtx b)
 {
+  if (SUBREG_P (a))
+    a = SUBREG_REG (a);
+  if (SUBREG_P (b))
+    b = SUBREG_REG (b);
   return !(MEM_P (a) && MEM_P (b)
 	   && !tdm_q_memory_p (a) && !tdm_q_memory_p (b));
+}
+
+/* Implement TARGET_MD_ASM_ADJUST.  Memory addressed through a pointer
+   needs $r0, so an asm can't have two such operands.  An operand that
+   may be a register or memory ("g", "rm") is left in memory when it
+   is already there, though: in alternatives that allow a register,
+   only allow memory that isn't addressed through $r0, so the others
+   are loaded into registers.  Those mustn't be $r0 either, which
+   would leave no base for the next one's load: "r" becomes "j".
+
+   An output in such memory becomes a register stored there after the
+   asm.  Left as memory, an in-out operand ("+g") would keep its
+   address in $r0 from the load before the asm to the store after
+   it.
+
+   Without optimization, the input and the output of a "+m" operand
+   are expanded separately, each with its own address: make the input
+   the output's memory, as there is only one base register.  */
+
+static rtx_insn *
+tdm_md_asm_adjust (vec<rtx> &outputs, vec<rtx> &inputs, vec<machine_mode> &,
+		   vec<const char *> &constraints, vec<rtx> &, vec<rtx> &,
+		   HARD_REG_SET &, location_t)
+{
+  rtx_insn *after = NULL;
+
+  for (unsigned int i = 0; i < constraints.length (); i++)
+    {
+      const char *c = constraints[i];
+      std::string out;
+      bool changed = false;
+
+      while (true)
+	{
+	  size_t len = strcspn (c, ",");
+	  std::string alt (c, len);
+	  bool reg = alt.find_first_of ("grqt") != std::string::npos;
+
+	  for (char ch : alt)
+	    if (ch == 'g')
+	      out += "jQi", changed = true;
+	    else if (ch == 'r')
+	      out += 'j', changed = true;
+	    else if (reg && ch == 'm')
+	      out += 'Q', changed = true;
+	    else
+	      out += ch;
+	  if (c[len] == '\0')
+	    break;
+	  out += ',';
+	  c += len + 1;
+	}
+      if (changed)
+	constraints[i] = ggc_strdup (out.c_str ());
+
+      if (i < outputs.length () && MEM_P (outputs[i])
+	  && !tdm_q_memory_p (outputs[i])
+	  && strpbrk (constraints[i], "jqt"))
+	{
+	  rtx reg = gen_reg_rtx (GET_MODE (outputs[i]));
+
+	  start_sequence ();
+	  emit_insn (after);
+	  emit_move_insn (outputs[i], reg);
+	  after = end_sequence ();
+	  outputs[i] = reg;
+	}
+    }
+
+  for (rtx &in : inputs)
+    for (rtx out : outputs)
+      if (MEM_P (in) && MEM_P (out) && in != out
+	  && GET_MODE (in) == GET_MODE (out)
+	  && !tdm_q_memory_p (in) && !tdm_q_memory_p (out)
+	  && MEM_EXPR (in) && MEM_EXPR (out)
+	  && MEM_OFFSET_KNOWN_P (in) && MEM_OFFSET_KNOWN_P (out)
+	  && known_eq (MEM_OFFSET (in), MEM_OFFSET (out))
+	  && operand_equal_p (MEM_EXPR (in), MEM_EXPR (out), 0))
+	{
+	  in = out;
+	  break;
+	}
+  return after;
 }
 
 /* Implement TARGET_CANNOT_SUBSTITUTE_MEM_EQUIV_P.  Memory addressed
@@ -1434,7 +1538,7 @@ tdm_conditional_register_usage (void)
 static bool
 tdm_class_likely_spilled_p (reg_class_t rclass)
 {
-  return rclass == R0_REGS || rclass == R_REGS;
+  return rclass == R0_REGS || rclass == R1_REGS || rclass == R_REGS;
 }
 
 static int
@@ -1761,6 +1865,8 @@ tdm_init_libfuncs (void)
 #define TARGET_LEGITIMATE_ADDRESS_P tdm_legitimate_address_p
 #undef  TARGET_FRAME_POINTER_REQUIRED
 #define TARGET_FRAME_POINTER_REQUIRED tdm_frame_pointer_required
+#undef  TARGET_MD_ASM_ADJUST
+#define TARGET_MD_ASM_ADJUST tdm_md_asm_adjust
 #undef  TARGET_CANNOT_SUBSTITUTE_MEM_EQUIV_P
 #define TARGET_CANNOT_SUBSTITUTE_MEM_EQUIV_P tdm_cannot_substitute_mem_equiv_p
 
