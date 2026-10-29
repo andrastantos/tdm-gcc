@@ -35,8 +35,10 @@
    each other.  */
 #undef  LIB_SPEC
 #define LIB_SPEC "%{!shared:%{!symbolic:--start-group -lc -lsim --end-group}}"
+/* -mlayout=largemem puts C data below word 0x8000 and code above it,
+   with ld's elf32tdm_largemem emulation.  */
 #undef  LINK_SPEC
-#define LINK_SPEC ""
+#define LINK_SPEC "%{mlayout=largemem:-m elf32tdm_largemem}"
 
 /* Run-time target specification.  */
 
