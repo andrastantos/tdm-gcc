@@ -168,11 +168,13 @@ enum reg_class
 {
   NO_REGS,
   R0_REGS,
+  R1_REGS,
   SP_REGS,
   R_REGS,
   MR_REGS,
   BASE_REGS,
   FP_BASE_REGS,
+  NOR0_REGS,
   GENERAL_REGS,
   ALL_REGS,
   LIM_REG_CLASSES
@@ -181,25 +183,27 @@ enum reg_class
 #define N_REG_CLASSES LIM_REG_CLASSES
 
 #define REG_CLASS_NAMES \
-{ "NO_REGS", "R0_REGS", "SP_REGS", "R_REGS", "MR_REGS", "BASE_REGS",	\
-  "FP_BASE_REGS", "GENERAL_REGS", "ALL_REGS" }
+{ "NO_REGS", "R0_REGS", "R1_REGS", "SP_REGS", "R_REGS", "MR_REGS",	\
+  "BASE_REGS", "FP_BASE_REGS", "NOR0_REGS", "GENERAL_REGS", "ALL_REGS" }
 
 #define REG_CLASS_CONTENTS			\
 {						\
   { 0x00000000, 0x00000000 },	/* NO_REGS */	\
   { 0x00000001, 0x00000000 },	/* R0_REGS */	\
+  { 0x00000002, 0x00000000 },	/* R1_REGS */	\
   { 0x00000000, 0x00000004 },	/* SP_REGS */	\
   { 0x00000003, 0x00000000 },	/* R_REGS */	\
   { 0xfffffffc, 0x00000003 },	/* MR_REGS */	\
   { 0x00000001, 0x00000034 },	/* BASE_REGS: $r0, $sp, ?ap, ?fp */ \
   { 0x00000101, 0x00000034 },	/* FP_BASE_REGS: + $mr6 */	\
+  { 0xfffffffe, 0x00000033 },	/* NOR0_REGS: GENERAL_REGS - $r0 */ \
   { 0xffffffff, 0x00000033 },	/* GENERAL_REGS: + ?ap, ?fp */ \
   { 0xffffffff, 0x0000003f }	/* ALL_REGS */	\
 }
 
 #define REGNO_REG_CLASS(REGNO)				\
   ((REGNO) == R0_REGNUM ? R0_REGS			\
-   : (REGNO) == R1_REGNUM ? R_REGS			\
+   : (REGNO) == R1_REGNUM ? R1_REGS			\
    : TDM_MR_P (REGNO) ? MR_REGS				\
    : (REGNO) == SP_REGNUM ? SP_REGS			\
    : (REGNO) == PC_REGNUM ? ALL_REGS : GENERAL_REGS)

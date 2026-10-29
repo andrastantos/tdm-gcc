@@ -247,20 +247,28 @@
 ;; A predicate instruction executes the next one only if its condition
 ;; holds.  Short branches reach about 30 words; long ones load the
 ;; target from a literal.
+;;
+;; The second alternative compares $r1 with memory addressed through
+;; $r0, or a far stack slot: the operand goes to the scratch word
+;; first.  Register allocation would otherwise need a register for it
+;; while $r0 is the address, and with the first operand in $r0 there
+;; is none.  It is always a long branch.
 (define_insn "*cbranchhi4"
   [(set (pc)
 	(if_then_else (match_operator 0 "tdm_cbranch_operator"
-			[(match_operand:HI 1 "register_operand" "q")
-			 (match_operand:HI 2 "general_operand" "rQI")])
+			[(match_operand:HI 1 "register_operand" "q,?t")
+			 (match_operand:HI 2 "general_operand" "rQI,m")])
 		      (label_ref (match_operand 3))
 		      (pc)))]
   ""
   "* return tdm_output_cbranch (operands, insn);"
   [(set (attr "length")
-	(if_then_else (and (ge (minus (match_dup 3) (pc)) (const_int -56))
-			   (le (minus (match_dup 3) (pc)) (const_int 56)))
-		      (const_int 6)
-		      (const_int 10)))])
+	(cond [(eq_attr "alternative" "1")
+		 (const_int 30)
+	       (and (ge (minus (match_dup 3) (pc)) (const_int -56))
+		    (le (minus (match_dup 3) (pc)) (const_int 56)))
+		 (const_int 6)]
+	      (const_int 10)))])
 
 (define_insn "jump"
   [(set (pc) (label_ref (match_operand 0)))]

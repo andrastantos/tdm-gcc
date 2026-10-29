@@ -22,6 +22,12 @@
 (define_register_constraint "q" "R_REGS"
   "The real registers, $r0 and $r1.")
 
+(define_register_constraint "t" "R1_REGS"
+  "$r1.")
+
+(define_register_constraint "j" "NOR0_REGS"
+  "Any register but $r0: for asm operands, see tdm_md_asm_adjust.")
+
 (define_register_constraint "k" "SP_REGS"
   "The stack pointer.")
 
