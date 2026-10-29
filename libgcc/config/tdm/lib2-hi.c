@@ -39,6 +39,7 @@ HItype __ashlhi3 (HItype, HItype);
 HItype __ashrhi3 (HItype, HItype);
 HItype __lshrhi3 (HItype, HItype);
 HItype __clzhi2 (UHItype);
+HItype __clrsbhi2 (HItype);
 HItype __ctzhi2 (UHItype);
 HItype __ffshi2 (UHItype);
 HItype __popcounthi2 (UHItype);
@@ -202,6 +203,15 @@ __clzhi2 (UHItype x)
   if (!(x & 0x8000))
     n += 1;
   return n;
+}
+
+/* The number of bits after the sign bit that equal it; 15 for 0 and
+   -1.  */
+
+HItype
+__clrsbhi2 (HItype x)
+{
+  return __clzhi2 (x < 0 ? ~(UHItype) x : (UHItype) x) - 1;
 }
 
 /* The number of trailing zero bits; 16 for 0.  */
