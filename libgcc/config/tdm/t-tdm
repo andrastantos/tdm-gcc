@@ -1,6 +1,7 @@
 # TDM has no multiply, divide or variable shift instructions: provide
 # the 16-bit operations, and the 32-bit ones that libgcc2 takes for
-# native.
+# native; and -ftrapv's 16-bit operations.
 
 LIB2ADD += $(srcdir)/config/tdm/lib2-hi.c \
-	   $(srcdir)/config/tdm/lib2-si.c
+	   $(srcdir)/config/tdm/lib2-si.c \
+	   $(srcdir)/config/tdm/lib2-trapv.c
