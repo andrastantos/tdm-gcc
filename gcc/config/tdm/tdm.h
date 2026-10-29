@@ -31,8 +31,10 @@
 #define STARTFILE_SPEC "crt0%O%s"
 #undef  ENDFILE_SPEC
 #define ENDFILE_SPEC ""
+/* libsim is libgloss' support for the simulator; it and libc need
+   each other.  */
 #undef  LIB_SPEC
-#define LIB_SPEC "%{!shared:%{!symbolic:-lc}}"
+#define LIB_SPEC "%{!shared:%{!symbolic:--start-group -lc -lsim --end-group}}"
 #undef  LINK_SPEC
 #define LINK_SPEC ""
 
