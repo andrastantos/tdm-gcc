@@ -330,6 +330,15 @@ tdm_symbolic_text (rtx x, char *buf, size_t len)
 
   gcc_assert (SYMBOL_REF_P (x));
   const char *name = targetm.strip_name_encoding (XSTR (x, 0));
+  /* As output_addr_const and assemble_name do: this is how weak
+     references get declared weak.  */
+  if (!tdm_counting)
+    {
+      if (SYMBOL_REF_DECL (x))
+	assemble_external (SYMBOL_REF_DECL (x));
+      if (tree id = maybe_get_identifier (name))
+	mark_referenced (id);
+    }
   if (SYMBOL_REF_FUNCTION_P (x))
     {
       if (off)
