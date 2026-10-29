@@ -25,10 +25,15 @@ see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
 
 /* These are what the operations themselves turn into, so they only
    use addition, logic and shifts by constants (which TDM does inline),
-   and no loops that GCC could recognize as a bit count.  */
+   and no loops that GCC could recognize as a bit count.  The -ftrapv
+   routines at the end are the exception: __mulvhi3 multiplies in
+   32 bits.  */
 
 typedef int HItype __attribute__ ((mode (HI)));
 typedef unsigned int UHItype __attribute__ ((mode (HI)));
+typedef int SItype __attribute__ ((mode (SI)));
+
+extern void abort (void);
 
 HItype __mulhi3 (HItype, HItype);
 UHItype __udivhi3 (UHItype, UHItype);
@@ -44,6 +49,11 @@ HItype __ctzhi2 (UHItype);
 HItype __ffshi2 (UHItype);
 HItype __popcounthi2 (UHItype);
 HItype __parityhi2 (UHItype);
+HItype __addvhi3 (HItype, HItype);
+HItype __subvhi3 (HItype, HItype);
+HItype __mulvhi3 (HItype, HItype);
+HItype __negvhi2 (HItype);
+HItype __absvhi2 (HItype);
 
 HItype
 __mulhi3 (HItype a, HItype b)
@@ -266,4 +276,52 @@ __parityhi2 (UHItype x)
   x ^= x >> 2;
   x ^= x >> 1;
   return x & 1;
+}
+
+/* -ftrapv: arithmetic that aborts on overflow.  */
+
+HItype
+__addvhi3 (HItype a, HItype b)
+{
+  HItype w = (UHItype) a + (UHItype) b;
+
+  if (b >= 0 ? w < a : w > a)
+    abort ();
+  return w;
+}
+
+HItype
+__subvhi3 (HItype a, HItype b)
+{
+  HItype w = (UHItype) a - (UHItype) b;
+
+  if (b >= 0 ? w > a : w < a)
+    abort ();
+  return w;
+}
+
+HItype
+__mulvhi3 (HItype a, HItype b)
+{
+  SItype w = (SItype) a * (SItype) b;
+
+  if (w != (HItype) w)
+    abort ();
+  return w;
+}
+
+HItype
+__negvhi2 (HItype a)
+{
+  if (a == -0x7fff - 1)
+    abort ();
+  return -a;
+}
+
+HItype
+__absvhi2 (HItype a)
+{
+  if (a == -0x7fff - 1)
+    abort ();
+  return a < 0 ? -a : a;
 }
