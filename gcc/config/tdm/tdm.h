@@ -259,6 +259,12 @@ enum reg_class
    needn't keep a hard frame pointer: the eliminable one will do.  */
 #define INITIAL_FRAME_ADDRESS_RTX frame_pointer_rtx
 
+/* The return address is in the word $sp addressed on entry, where the
+   argument pointer points.  Without a frame chain, other frames'
+   return addresses are unknown: 0.  */
+#define RETURN_ADDR_RTX(COUNT, FRAME)				\
+  ((COUNT) == 0 ? gen_frame_mem (Pmode, arg_pointer_rtx) : NULL_RTX)
+
 /* Arguments: the first one in $r0 if it fits in a word, the others on
    the stack.  Results of up to 32 bits come back in $r0 (and $r1).  */
 
@@ -269,7 +275,8 @@ enum reg_class
 
 #define DEFAULT_PCC_STRUCT_RETURN 0
 
-#define TRAMPOLINE_SIZE 8
+/* Five words: see tdm_trampoline_init.  */
+#define TRAMPOLINE_SIZE 10
 #define TRAMPOLINE_ALIGNMENT 16
 
 #define FUNCTION_PROFILER(FILE, LABELNO) \

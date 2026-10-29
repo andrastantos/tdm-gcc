@@ -1187,6 +1187,43 @@ tdm_expand_nonlocal_goto (rtx *operands)
   emit_barrier ();
 }
 
+/* Trampolines, written as data on the stack:
+
+	mov	$r1, [$pc+3]
+	mov	$mr18, $r1		; the static chain
+	mov	$pc, [$pc+2]
+	.word	CHAIN
+	.word	FUNCTION
+
+   $r1 is free at a call, which loads the target through it.  The
+   instructions are stored as numbers rather than copied from a
+   template: code may be above word 0x8000, out of reach of the byte
+   pointers that copying uses.  */
+
+static void
+tdm_trampoline_init (rtx m_tramp, tree fndecl, rtx chain_value)
+{
+  static const unsigned short code[] = { 0x80c3, 0x8bd2, 0x8002 };
+  rtx fnaddr = XEXP (DECL_RTL (fndecl), 0);
+
+  gcc_assert (STATIC_CHAIN_REGNUM == MR0_REGNUM + 18);
+  for (unsigned int i = 0; i < ARRAY_SIZE (code); i++)
+    emit_move_insn (adjust_address (m_tramp, HImode, 2 * i),
+		    gen_int_mode (code[i], HImode));
+  emit_move_insn (adjust_address (m_tramp, HImode, 6), chain_value);
+  emit_move_insn (adjust_address (m_tramp, HImode, 8), fnaddr);
+}
+
+/* The trampoline is written at its octet address and called at its
+   word address.  */
+
+static rtx
+tdm_trampoline_adjust_address (rtx addr)
+{
+  return expand_simple_binop (Pmode, LSHIFTRT, addr, const1_rtx,
+			      NULL_RTX, true, OPTAB_LIB_WIDEN);
+}
+
 /* Make the first N OPERANDS of an insn pairwise acceptable to
    tdm_operand_pair_ok_p by loading inputs into registers.  Operand 0
    is the output.  */
@@ -1294,8 +1331,6 @@ tdm_expand_prologue (void)
     tdm_emit_sp_adjust (-f.total);
 
   off = 2 + f.outgoing;
-  if (f.saved && off + f.saved > 64)
-    sorry ("too many outgoing arguments for the saved registers");
   for (unsigned int regno = MR0_REGNUM; regno <= MR31_REGNUM; regno++)
     if (tdm_save_reg_p (regno))
       {
@@ -1763,5 +1798,10 @@ tdm_init_libfuncs (void)
 #define TARGET_ASM_UNALIGNED_DI_OP NULL
 #undef  TARGET_CONSTANT_ALIGNMENT
 #define TARGET_CONSTANT_ALIGNMENT tdm_constant_alignment
+
+#undef  TARGET_TRAMPOLINE_INIT
+#define TARGET_TRAMPOLINE_INIT tdm_trampoline_init
+#undef  TARGET_TRAMPOLINE_ADJUST_ADDRESS
+#define TARGET_TRAMPOLINE_ADJUST_ADDRESS tdm_trampoline_adjust_address
 
 struct gcc_target targetm = TARGET_INITIALIZER;
