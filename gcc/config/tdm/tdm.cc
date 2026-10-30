@@ -1253,6 +1253,69 @@ tdm_md_asm_adjust (vec<rtx> &outputs, vec<rtx> &inputs, vec<machine_mode> &,
 	  in = out;
 	  break;
 	}
+
+  /* Memory-only operands at different addresses through $r0 can't all
+     have it: keep one there, and give the others a stack temporary,
+     which $sp addresses, copied in before the asm and out after it.
+     Memory without a mode (BLKmode) isn't copied, so it is the one
+     kept.  The input of an in-out operand is its output's rtx, and is
+     replaced with it.  */
+  auto mem_only_p = [&] (unsigned int i, rtx x)
+    {
+      const char *c = constraints[i];
+      return (MEM_P (x) && !tdm_q_memory_p (x)
+	      && !ISDIGIT (*c) && !strpbrk (c, "jqtk")
+	      && strpbrk (c, "mo"));
+    };
+  unsigned int nout = outputs.length ();
+  auto_vec<rtx> mems;
+  rtx kept = NULL_RTX;
+
+  for (unsigned int i = 0; i < constraints.length (); i++)
+    {
+      rtx x = i < nout ? outputs[i] : inputs[i - nout];
+      if (!mem_only_p (i, x))
+	continue;
+      if (GET_MODE (x) == BLKmode)
+	{
+	  if (!kept)
+	    kept = x;
+	}
+      else
+	mems.safe_push (x);
+    }
+  if (!kept && !mems.is_empty ())
+    kept = mems[0];
+  for (rtx m : mems)
+    {
+      if (rtx_equal_p (m, kept))
+	continue;
+
+      rtx temp = assign_stack_temp (GET_MODE (m), GET_MODE_SIZE (GET_MODE (m)));
+      bool read = false, written = false;
+
+      for (unsigned int i = 0; i < constraints.length (); i++)
+	{
+	  rtx &x = i < nout ? outputs[i] : inputs[i - nout];
+	  if (MEM_P (x) && rtx_equal_p (x, m))
+	    {
+	      x = temp;
+	      if (i < nout)
+		written = true;
+	      else
+		read = true;
+	    }
+	}
+      if (read)
+	emit_move_insn (temp, m);
+      if (written)
+	{
+	  start_sequence ();
+	  emit_insn (after);
+	  emit_move_insn (m, temp);
+	  after = end_sequence ();
+	}
+    }
   return after;
 }
 
