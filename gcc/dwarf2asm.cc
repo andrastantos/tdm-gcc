@@ -46,12 +46,15 @@ along with GCC; see the file COPYING3.  If not see
 void
 dw2_assemble_integer (int size, rtx x)
 {
-  if (size == 2 * (int) DWARF2_ADDR_SIZE && !CONST_SCALAR_INT_P (x))
+  if (size == 2 * (int) DWARF2_ADDR_SIZE && size == 8
+      && !CONST_SCALAR_INT_P (x))
     {
       /* On 32-bit targets with -gdwarf64, DImode values with
 	 relocations usually result in assembler errors.  Assume
 	 all such values are positive and emit the relocation only
-	 in the least significant half.  */
+	 in the least significant half.  Targets with 16-bit addresses
+	 can still relocate 32-bit offsets, which may not fit in 16
+	 bits.  */
       const char *op = integer_asm_op (DWARF2_ADDR_SIZE, false);
       if (BYTES_BIG_ENDIAN)
 	{
