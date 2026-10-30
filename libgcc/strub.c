@@ -62,6 +62,10 @@ __strub_update (void **watermark)
     *watermark = sp;
 }
 
+#ifndef TARGET_STRUB_DYNAMIC_ARRAY_EXTRA
+# define TARGET_STRUB_DYNAMIC_ARRAY_EXTRA 0
+#endif
+
 #if TARGET_STRUB_USE_DYNAMIC_ARRAY && ! defined TARGET_STRUB_MAY_USE_MEMSET
 # define TARGET_STRUB_MAY_USE_MEMSET 1
 #endif
@@ -114,9 +118,12 @@ __strub_leave (void **mark)
      potential security implications, compute the length without that
      expectation.  If the pointers are misaligned, we may leave a partial
      unscrubbed word behind.  */
-  ptrdiff_t len = ((char *)end - (char *)base) / sizeof (void *);
+  ptrdiff_t len = ((UQItype *)end - (UQItype *)base) / sizeof (void *);
   /* Allocate a dynamically-sized array covering the desired range, so that we
-     can safely call memset on it.  */
+     can safely call memset on it.  The array goes above the outgoing
+     arguments of the memset call, so it may need to extend beyond BASE
+     by that much to reach it.  */
+  len += TARGET_STRUB_DYNAMIC_ARRAY_EXTRA;
   void *ptr[len];
   base = &ptr[0];
   end = &ptr[len];
