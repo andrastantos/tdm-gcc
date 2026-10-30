@@ -1152,6 +1152,7 @@ moxie-*-elf | moxie-*-moxiebox* | moxie-*-uclinux* | moxie-*-rtems*)
 	;;
 tdm-*-elf*)
 	tmake_file="$tmake_file t-fdpbit tdm/t-tdm"
+	tm_file="$tm_file tdm/tdm-lib.h"
 	;;
 msp430-*-elf*)
 	tmake_file="$tm_file t-crtstuff t-fdpbit msp430/t-msp430"
