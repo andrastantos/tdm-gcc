@@ -1173,6 +1173,24 @@ tdm_operand_pair_ok_p (rtx a, rtx b)
 	   && !tdm_q_memory_p (a) && !tdm_q_memory_p (b));
 }
 
+/* Prepare the operands of a move expander in MODE that stores to
+   memory: the value must be in a register.  Not in $r0 if the memory is
+   addressed through a pointer, which needs $r0 too: an incoming
+   argument stored to an over-aligned stack slot has its address
+   computed while it is still in $r0, so copy it out first.  */
+
+void
+tdm_expand_store (rtx *operands, machine_mode mode)
+{
+  if (!MEM_P (operands[0]) || !can_create_pseudo_p ())
+    return;
+  if (!register_operand (operands[1], mode))
+    operands[1] = force_reg (mode, operands[1]);
+  else if (REG_P (operands[1]) && REGNO (operands[1]) == R0_REGNUM
+	   && !tdm_q_memory_p (operands[0]))
+    operands[1] = copy_to_mode_reg (mode, operands[1]);
+}
+
 /* Implement TARGET_MD_ASM_ADJUST.  Memory addressed through a pointer
    needs $r0, so an asm can't have two such operands.  An operand that
    may be a register or memory ("g", "rm") is left in memory when it
@@ -1499,6 +1517,8 @@ tdm_expand_prologue (void)
   HOST_WIDE_INT off;
 
   tdm_compute_frame (&f);
+  if (flag_stack_usage_info)
+    current_function_static_stack_size = f.total;
   if (f.total)
     tdm_emit_sp_adjust (-f.total);
 

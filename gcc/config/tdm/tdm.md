@@ -57,9 +57,7 @@
 	(match_operand:HI 1 "general_operand"))]
   ""
 {
-  if (MEM_P (operands[0]) && can_create_pseudo_p ()
-      && !register_operand (operands[1], HImode))
-    operands[1] = force_reg (HImode, operands[1]);
+  tdm_expand_store (operands, HImode);
 })
 
 ;; The frame pointer $mr6 holds a word address, which moves double
@@ -95,9 +93,7 @@
 	(match_operand:QI 1 "general_operand"))]
   ""
 {
-  if (MEM_P (operands[0]) && can_create_pseudo_p ()
-      && !register_operand (operands[1], QImode))
-    operands[1] = force_reg (QImode, operands[1]);
+  tdm_expand_store (operands, QImode);
 })
 
 (define_insn "*movqi"
