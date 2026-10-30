@@ -22,6 +22,7 @@ extern void tdm_expand_epilogue (void);
 extern void tdm_expand_cbranch (rtx *);
 extern bool tdm_q_memory_p (rtx);
 extern bool tdm_operand_pair_ok_p (rtx, rtx);
+extern void tdm_expand_store (rtx *, machine_mode);
 extern void tdm_fix_operand_pairs (rtx *, int);
 extern void tdm_expand_nonlocal_goto (rtx *);
 extern const char *tdm_output_raw_fp (rtx, bool);
