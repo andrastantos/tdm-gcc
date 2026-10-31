@@ -386,12 +386,15 @@
   ""
   [(set_attr "length" "0")])
 
-;; A literal pool, after a barrier: the words of pool OPERAND 0 of the
-;; current function, each with its label (see tdm_reorg).
+;; A literal pool: the words of pool operand 0 of the current function,
+;; each with its label (see tdm_reorg).  After a barrier, operand 1 is
+;; 0; in the middle of the code, it is 1 and a jump over the words comes
+;; first.
 (define_insn "tdm_pool"
-  [(unspec_volatile [(match_operand 0 "const_int_operand")] UNSPECV_POOL)]
+  [(unspec_volatile [(match_operand 0 "const_int_operand")
+		     (match_operand 1 "const_int_operand")] UNSPECV_POOL)]
   ""
-  "* return tdm_output_pool (operands[0]);")
+  "* return tdm_output_pool (operands[0], operands[1]);")
 
 (define_insn "nop"
   [(const_int 0)]

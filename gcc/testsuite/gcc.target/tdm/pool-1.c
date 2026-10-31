@@ -21,4 +21,4 @@ use (int x)
 
 /* { dg-final { scan-assembler {\[\$pc\+\(\.Llit[0-9]+-\.\)\]} } } */
 /* { dg-final { scan-assembler {\.Llit[0-9]+:\n\t\.word\t1234\n} } } */
-/* { dg-final { scan-assembler-not {mov\t\$pc, \$pc\+2\n} } } */
+/* { dg-final { scan-assembler-not {\[\$pc\+2\]\n\tmov\t\$pc, \$pc\+2\n} } } */
