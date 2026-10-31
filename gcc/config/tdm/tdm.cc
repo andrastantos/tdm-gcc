@@ -21,6 +21,7 @@
 
 #include "config.h"
 #define INCLUDE_STRING
+#define INCLUDE_VECTOR
 #include "system.h"
 #include "coretypes.h"
 #include "backend.h"
@@ -47,6 +48,8 @@
 #include "expr.h"
 #include "optabs.h"
 #include "builtins.h"
+#include "dumpfile.h"
+#include "insn-addr.h"
 
 /* This file should be included last.  */
 #include "target-def.h"
@@ -96,6 +99,29 @@ struct tdm_loc
 
 static bool tdm_counting;
 static int tdm_words;
+
+/* Literals: words in the code that an instruction loads through
+   [$pc+N], for a wide operand or a far branch target.  */
+
+enum tdm_lit_kind
+{
+  LIT_CONST,				/* A wide operand.  */
+  LIT_JUMP,				/* mov $pc, [lit]: a far jump, or a
+					   jump to a constant address.  */
+  LIT_CBRANCH				/* The far jump of a cbranch.  */
+};
+
+struct tdm_lit
+{
+  enum tdm_lit_kind kind;
+  /* The word of the using instruction within its insn's output.  */
+  int word;
+  std::string text;
+};
+
+/* While counting, the literals of the insn are added here if this is
+   set (see tdm_reorg).  */
+static std::vector<tdm_lit> *tdm_lits;
 
 static tdm_loc
 tdm_make_loc (enum tdm_loc_kind kind, HOST_WIDE_INT n = 0)
@@ -381,12 +407,18 @@ tdm_sorry (const char *msg)
 }
 
 /* Emit OP with the word WORD as second operand, from a literal that
-   the code jumps over.  */
+   the code jumps over.  A "mov $pc" loads the literal directly, as
+   KIND, which is LIT_JUMP or LIT_CBRANCH.  */
 
 static void
-tdm_emit_literal (const char *op, const char *dest, const char *word)
+tdm_emit_literal (const char *op, const char *dest, const char *word,
+		  enum tdm_lit_kind kind = LIT_JUMP)
 {
-  if (strcmp (op, "mov") == 0 && strcmp (dest, "$pc") == 0)
+  bool jump = strcmp (op, "mov") == 0 && strcmp (dest, "$pc") == 0;
+
+  if (tdm_lits)
+    tdm_lits->push_back ({jump ? kind : LIT_CONST, tdm_words, word});
+  if (jump)
     {
       tdm_emit ("mov\t$pc, [$pc+1]");
       tdm_emit (".word\t%s", word);
@@ -1021,8 +1053,7 @@ tdm_output_cbranch (rtx *operands, rtx_insn *insn)
   else
     {
       tdm_emit ("mov\t$pc, $pc+3");
-      tdm_emit ("mov\t$pc, [$pc+1]");
-      tdm_emit (".word\t%s", lab);
+      tdm_emit_literal ("mov", "$pc", lab, LIT_CBRANCH);
     }
   return "";
 }
@@ -1034,10 +1065,7 @@ tdm_output_jump (rtx label, rtx_insn *insn)
 
   tdm_label_text (label, lab, sizeof lab);
   if (get_attr_length (insn) > 2)
-    {
-      tdm_emit ("mov\t$pc, [$pc+1]");
-      tdm_emit (".word\t%s", lab);
-    }
+    tdm_emit_literal ("mov", "$pc", lab);
   else
     tdm_emit ("mov\t$pc, $pc+(%s-.)", lab);
   return "";
@@ -1063,10 +1091,10 @@ tdm_output_call (rtx addr)
 }
 
 /* The length of INSN, in octets: count what its output function
-   emits.  */
+   emits.  If LITS is given, add the literals it emits there.  */
 
-int
-tdm_insn_length (rtx_insn *insn)
+static int
+tdm_count_insn (rtx_insn *insn, std::vector<tdm_lit> *lits)
 {
   int code = recog_memoized (insn);
   const char *tmpl;
@@ -1078,7 +1106,9 @@ tdm_insn_length (rtx_insn *insn)
   extract_constrain_insn_cached (insn);
   tdm_counting = true;
   tdm_words = 0;
+  tdm_lits = lits;
   tmpl = get_insn_template (code, insn);
+  tdm_lits = NULL;
   tdm_counting = false;
   words = tdm_words;
   if (tmpl && *tmpl)
@@ -1089,6 +1119,56 @@ tdm_insn_length (rtx_insn *insn)
 	  words++;
     }
   return words * 2;
+}
+
+int
+tdm_insn_length (rtx_insn *insn)
+{
+  return tdm_count_insn (insn, NULL);
+}
+
+/* Machine-dependent reorg: find the literals of the function and the
+   address of each use.  They stay next to their uses for now; the
+   mach dump lists them.  */
+
+static void
+tdm_reorg (void)
+{
+  static const char *const kinds[] = { "const", "jump", "cbranch" };
+  std::vector<tdm_lit> lits;
+  int n[3] = {}, nasm = 0;
+
+  shorten_branches (get_insns ());
+  for (rtx_insn *insn = get_insns (); insn; insn = NEXT_INSN (insn))
+    {
+      if (!NONDEBUG_INSN_P (insn))
+	continue;
+      if (recog_memoized (insn) < 0)
+	{
+	  if (asm_noperands (PATTERN (insn)) >= 0
+	      || GET_CODE (PATTERN (insn)) == ASM_INPUT)
+	    nasm++;
+	  continue;
+	}
+      lits.clear ();
+      int len = tdm_count_insn (insn, &lits);
+      if (dump_file && len != get_attr_length (insn))
+	fprintf (dump_file, ";; length: insn %d (%s), attribute %d, emitted %d\n",
+		 INSN_UID (insn), get_insn_name (INSN_CODE (insn)),
+		 get_attr_length (insn), len);
+      for (const tdm_lit &l : lits)
+	{
+	  n[l.kind]++;
+	  if (dump_file)
+	    fprintf (dump_file, ";; literal %s: insn %d, word %d: %s\n",
+		     kinds[l.kind], INSN_UID (insn),
+		     INSN_ADDRESSES (INSN_UID (insn)) / 2 + l.word,
+		     l.text.c_str ());
+	}
+    }
+  if (dump_file)
+    fprintf (dump_file, ";; literals: const %d jump %d cbranch %d, asm %d\n",
+	     n[LIT_CONST], n[LIT_JUMP], n[LIT_CBRANCH], nasm);
 }
 
 /* Branch expansion.  The predicate instructions compare a register
@@ -1948,6 +2028,8 @@ tdm_init_libfuncs (void)
 #define TARGET_LEGITIMATE_ADDRESS_P tdm_legitimate_address_p
 #undef  TARGET_FRAME_POINTER_REQUIRED
 #define TARGET_FRAME_POINTER_REQUIRED tdm_frame_pointer_required
+#undef  TARGET_MACHINE_DEPENDENT_REORG
+#define TARGET_MACHINE_DEPENDENT_REORG tdm_reorg
 #undef  TARGET_MD_ASM_ADJUST
 #define TARGET_MD_ASM_ADJUST tdm_md_asm_adjust
 #undef  TARGET_CANNOT_SUBSTITUTE_MEM_EQUIV_P
