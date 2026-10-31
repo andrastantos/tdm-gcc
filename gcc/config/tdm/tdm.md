@@ -42,7 +42,8 @@
 
 (define_c_enum "unspecv"
   [UNSPECV_BLOCKAGE
-   UNSPECV_NONLOCAL_JUMP])
+   UNSPECV_NONLOCAL_JUMP
+   UNSPECV_POOL])
 
 ;; Lengths are in octets, two per instruction.  tdm_insn_length counts
 ;; the instructions the output functions emit.
@@ -384,6 +385,13 @@
   ""
   ""
   [(set_attr "length" "0")])
+
+;; A literal pool, after a barrier: the words of pool OPERAND 0 of the
+;; current function, each with its label (see tdm_reorg).
+(define_insn "tdm_pool"
+  [(unspec_volatile [(match_operand 0 "const_int_operand")] UNSPECV_POOL)]
+  ""
+  "* return tdm_output_pool (operands[0]);")
 
 (define_insn "nop"
   [(const_int 0)]

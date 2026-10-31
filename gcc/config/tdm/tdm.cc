@@ -22,6 +22,7 @@
 #include "config.h"
 #define INCLUDE_STRING
 #define INCLUDE_VECTOR
+#define INCLUDE_MAP
 #include "system.h"
 #include "coretypes.h"
 #include "backend.h"
@@ -122,6 +123,32 @@ struct tdm_lit
 /* While counting, the literals of the insn are added here if this is
    set (see tdm_reorg).  */
 static std::vector<tdm_lit> *tdm_lits;
+
+/* Literal pools: words after a barrier, where the code doesn't fall
+   through, each loaded with [$pc+(label-.)].  tdm_reorg sets them up
+   for the current function.  An entry is dropped (DEAD) when its use
+   ends up out of reach and goes back to an inline literal.  */
+
+struct tdm_pool_entry
+{
+  std::string text;
+  int label;
+  bool dead;
+};
+
+static std::vector<std::vector<tdm_pool_entry>> tdm_pools;
+
+/* For each insn with pooled literals (by UID), the pool label of each
+   of its literals in output order, or -1 for an inline one.  */
+static std::map<int, std::vector<int>> tdm_lit_labels;
+
+/* Pool labels are .LlitN, numbered across the file.  */
+static int tdm_lit_label_no;
+
+/* The insn being counted or output, and the index of its next
+   literal.  */
+static rtx_insn *tdm_lit_insn;
+static int tdm_lit_index;
 
 static tdm_loc
 tdm_make_loc (enum tdm_loc_kind kind, HOST_WIDE_INT n = 0)
@@ -415,9 +442,29 @@ tdm_emit_literal (const char *op, const char *dest, const char *word,
 		  enum tdm_lit_kind kind = LIT_JUMP)
 {
   bool jump = strcmp (op, "mov") == 0 && strcmp (dest, "$pc") == 0;
+  int label = -1;
+
+  if (!tdm_counting && current_output_insn != tdm_lit_insn)
+    {
+      tdm_lit_insn = current_output_insn;
+      tdm_lit_index = 0;
+    }
+  if (tdm_lit_insn)
+    {
+      auto it = tdm_lit_labels.find (INSN_UID (tdm_lit_insn));
+      if (it != tdm_lit_labels.end ()
+	  && tdm_lit_index < (int) it->second.size ())
+	label = it->second[tdm_lit_index];
+      tdm_lit_index++;
+    }
 
   if (tdm_lits)
     tdm_lits->push_back ({jump ? kind : LIT_CONST, tdm_words, word});
+  if (label >= 0)
+    {
+      tdm_emit ("%s\t%s, [$pc+(.Llit%d-.)]", op, dest, label);
+      return;
+    }
   if (jump)
     {
       tdm_emit ("mov\t$pc, [$pc+1]");
@@ -1054,6 +1101,8 @@ tdm_cbranch_prefix_length (rtx_insn *insn)
   bool counting = tdm_counting;
   int words = tdm_words;
   std::vector<tdm_lit> *lits = tdm_lits;
+  rtx_insn *lit_insn = tdm_lit_insn;
+  int lit_index = tdm_lit_index;
   int n;
 
   if (!reload_completed)
@@ -1062,11 +1111,17 @@ tdm_cbranch_prefix_length (rtx_insn *insn)
   tdm_counting = true;
   tdm_words = 0;
   tdm_lits = NULL;
+  /* The operand comes first in the insn's output: its literals are the
+     first ones.  */
+  tdm_lit_insn = insn;
+  tdm_lit_index = 0;
   tdm_cbranch_operand (recog_data.operand);
   n = tdm_words;
   tdm_counting = counting;
   tdm_words = words;
   tdm_lits = lits;
+  tdm_lit_insn = lit_insn;
+  tdm_lit_index = lit_index;
   return n * 2;
 }
 
@@ -1153,7 +1208,10 @@ tdm_count_insn (rtx_insn *insn, std::vector<tdm_lit> *lits)
   tdm_counting = true;
   tdm_words = 0;
   tdm_lits = lits;
+  tdm_lit_insn = insn;
+  tdm_lit_index = 0;
   tmpl = get_insn_template (code, insn);
+  tdm_lit_insn = NULL;
   tdm_lits = NULL;
   tdm_counting = false;
   words = tdm_words;
@@ -1173,27 +1231,99 @@ tdm_insn_length (rtx_insn *insn)
   return tdm_count_insn (insn, NULL);
 }
 
-/* Machine-dependent reorg: find the literals of the function and the
-   address of each use.  They stay next to their uses for now; the
-   mach dump lists them.  */
+/* Output pool ID of the current function: a label and a word for each
+   live entry.  */
+
+const char *
+tdm_output_pool (rtx id)
+{
+  gcc_assert (INTVAL (id) < (HOST_WIDE_INT) tdm_pools.size ());
+  for (const tdm_pool_entry &e : tdm_pools[INTVAL (id)])
+    if (!e.dead)
+      {
+	if (!tdm_counting)
+	  fprintf (asm_out_file, ".Llit%d:\n", e.label);
+	tdm_emit (".word\t%s", e.text.c_str ());
+      }
+  return "";
+}
+
+/* The word address of INSN, from shorten_branches.  */
+
+static int
+tdm_insn_word (rtx_insn *insn)
+{
+  return INSN_ADDRESSES (INSN_UID (insn)) / 2;
+}
+
+/* When choosing a pool, the distance to it is taken from the addresses
+   before any literal moves.  Allow for some change; the distances are
+   checked once the pools are in place.  */
+#define TDM_POOL_MARGIN 2
+
+/* A wide operand that may load its value from a pool.  */
+
+struct tdm_pool_use
+{
+  rtx_insn *insn;
+  /* Its index among the literals of INSN.  */
+  int index;
+  /* Its word address before any literal moves, and its segment: code
+     between an asm statement or a section switch and the next one.  A
+     use and its pool must be in the same segment: the length of an asm
+     statement is only an estimate.  */
+  int addr, seg;
+  std::string text;
+  /* Its pool and entry, or -1.  */
+  int pool, entry;
+};
+
+/* A place for a pool: after a barrier.  */
+
+struct tdm_pool_site
+{
+  rtx_insn *barrier;
+  int addr, seg;
+  /* The pool placed there, or -1.  */
+  int pool;
+};
+
+/* Machine-dependent reorg: put the wide operands of the function in
+   pools after barriers, in reach of their uses (-32..31 words).  The
+   others stay inline.  The mach dump lists the literals and pools.  */
 
 static void
 tdm_reorg (void)
 {
   static const char *const kinds[] = { "const", "jump", "cbranch" };
   std::vector<tdm_lit> lits;
-  int n[3] = {}, nasm = 0;
+  std::vector<tdm_pool_use> uses;
+  std::vector<tdm_pool_site> sites;
+  std::vector<rtx_insn *> pool_insns;
+  int n[3] = {}, nasm = 0, seg = 0, pooled = 0, reverted = 0;
 
+  tdm_pools.clear ();
+  tdm_lit_labels.clear ();
+  tdm_lit_insn = NULL;
+
+  /* Find the literals and the places for pools.  */
   shorten_branches (get_insns ());
   for (rtx_insn *insn = get_insns (); insn; insn = NEXT_INSN (insn))
     {
+      if (NOTE_P (insn) && NOTE_KIND (insn) == NOTE_INSN_SWITCH_TEXT_SECTIONS)
+	seg++;
+      if (BARRIER_P (insn))
+	sites.push_back ({insn, tdm_insn_word (insn), seg, -1});
       if (!NONDEBUG_INSN_P (insn))
 	continue;
       if (recog_memoized (insn) < 0)
 	{
 	  if (asm_noperands (PATTERN (insn)) >= 0
 	      || GET_CODE (PATTERN (insn)) == ASM_INPUT)
-	    nasm++;
+	    {
+	      nasm++;
+	      seg++;
+	    }
 	  continue;
 	}
       lits.clear ();
@@ -1202,19 +1332,103 @@ tdm_reorg (void)
 	fprintf (dump_file, ";; length: insn %d (%s), attribute %d, emitted %d\n",
 		 INSN_UID (insn), get_insn_name (INSN_CODE (insn)),
 		 get_attr_length (insn), len);
-      for (const tdm_lit &l : lits)
+      for (size_t i = 0; i < lits.size (); i++)
 	{
+	  const tdm_lit &l = lits[i];
+	  int addr = tdm_insn_word (insn) + l.word;
+
 	  n[l.kind]++;
 	  if (dump_file)
 	    fprintf (dump_file, ";; literal %s: insn %d, word %d: %s\n",
-		     kinds[l.kind], INSN_UID (insn),
-		     INSN_ADDRESSES (INSN_UID (insn)) / 2 + l.word,
-		     l.text.c_str ());
+		     kinds[l.kind], INSN_UID (insn), addr, l.text.c_str ());
+	  if (l.kind == LIT_CONST)
+	    uses.push_back ({insn, (int) i, addr, seg, l.text, -1, -1});
 	}
     }
   if (dump_file)
     fprintf (dump_file, ";; literals: const %d jump %d cbranch %d, asm %d\n",
 	     n[LIT_CONST], n[LIT_JUMP], n[LIT_CBRANCH], nasm);
+
+  /* Give each use the nearest pool in reach.  */
+  for (tdm_pool_use &u : uses)
+    {
+      tdm_pool_site *best = NULL;
+      int best_dist = INT_MAX;
+
+      for (tdm_pool_site &s : sites)
+	{
+	  int size = s.pool < 0 ? 0 : (int) tdm_pools[s.pool].size ();
+	  int off = s.addr + size - u.addr;
+
+	  if (s.seg == u.seg
+	      && off >= -32 + TDM_POOL_MARGIN && off <= 31 - TDM_POOL_MARGIN
+	      && abs (off) < best_dist)
+	    {
+	      best = &s;
+	      best_dist = abs (off);
+	    }
+	}
+      if (!best)
+	continue;
+      if (best->pool < 0)
+	{
+	  best->pool = tdm_pools.size ();
+	  tdm_pools.emplace_back ();
+	  rtx_insn *p = emit_insn_after (gen_tdm_pool (GEN_INT (best->pool)),
+					 best->barrier);
+	  emit_barrier_after (p);
+	  pool_insns.push_back (p);
+	}
+      u.pool = best->pool;
+      u.entry = tdm_pools[u.pool].size ();
+      tdm_pools[u.pool].push_back ({u.text, ++tdm_lit_label_no, false});
+      std::vector<int> &labels = tdm_lit_labels[INSN_UID (u.insn)];
+      if ((int) labels.size () <= u.index)
+	labels.resize (u.index + 1, -1);
+      labels[u.index] = tdm_lit_label_no;
+      pooled++;
+    }
+
+  /* Check the distances with the pools in place, and put the uses out
+     of reach back inline, until all are in reach.  Each round only
+     drops entries.  */
+  for (bool changed = pooled > 0; changed; )
+    {
+      changed = false;
+      shorten_branches (get_insns ());
+      for (tdm_pool_use &u : uses)
+	{
+	  if (u.pool < 0)
+	    continue;
+	  lits.clear ();
+	  tdm_count_insn (u.insn, &lits);
+	  int from = tdm_insn_word (u.insn) + lits[u.index].word;
+	  int to = tdm_insn_word (pool_insns[u.pool]);
+	  for (int e = 0; e < u.entry; e++)
+	    if (!tdm_pools[u.pool][e].dead)
+	      to++;
+	  if (to - from < -32 || to - from > 31)
+	    {
+	      tdm_pools[u.pool][u.entry].dead = true;
+	      tdm_lit_labels[INSN_UID (u.insn)][u.index] = -1;
+	      u.pool = -1;
+	      pooled--;
+	      reverted++;
+	      changed = true;
+	    }
+	}
+    }
+
+  if (dump_file)
+    {
+      for (const tdm_pool_use &u : uses)
+	if (u.pool >= 0)
+	  fprintf (dump_file, ";; pooled: insn %d literal %d in pool %d: %s\n",
+		   INSN_UID (u.insn), u.index, u.pool, u.text.c_str ());
+      fprintf (dump_file, ";; pools %d, pooled %d, back inline %d, "
+	       "inline %d\n", (int) tdm_pools.size (), pooled, reverted,
+	       (int) uses.size () - pooled);
+    }
 }
 
 /* Branch expansion.  The predicate instructions compare a register

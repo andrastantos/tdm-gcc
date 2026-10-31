@@ -35,6 +35,7 @@ extern const char *tdm_output_shift (enum rtx_code, rtx *);
 extern const char *tdm_output_extend (enum rtx_code, rtx *);
 extern const char *tdm_output_cbranch (rtx *, rtx_insn *);
 extern int tdm_adjust_insn_length (rtx_insn *, int);
+extern const char *tdm_output_pool (rtx);
 extern const char *tdm_output_jump (rtx, rtx_insn *);
 extern const char *tdm_output_indirect_jump (rtx);
 extern const char *tdm_output_call (rtx);
