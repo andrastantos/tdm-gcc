@@ -1243,15 +1243,45 @@ tdm_insn_length (rtx_insn *insn)
   return tdm_count_insn (insn, NULL);
 }
 
+/* A pool of the current function.  */
+
+struct tdm_pool
+{
+  rtx_insn *insn;
+  /* The number of entries; whether a jump over them comes first; the
+     estimated word address of the pool.  */
+  int size;
+  bool skip;
+  int addr;
+};
+
+static auto_vec<tdm_pool> tdm_pools;
+
 /* Output pool ID of the current function: a label and a word for each
-   live entry.  */
+   live entry, after a jump over them if SKIP.  While tdm_reorg places
+   the pools, before the entries are laid out, only count them.  */
 
 const char *
-tdm_output_pool (rtx id)
+tdm_output_pool (rtx id, rtx skip)
 {
   unsigned int pool = INTVAL (id);
+  int live = 0;
 
-  gcc_assert (pool + 1 < tdm_pool_start.length ());
+  gcc_assert (pool < tdm_pools.length ());
+  if (pool + 1 >= tdm_pool_start.length ())
+    {
+      gcc_assert (tdm_counting);
+      if (INTVAL (skip) && tdm_pools[pool].size)
+	tdm_emit ("mov\t$pc, $pc+%d", tdm_pools[pool].size + 1);
+      for (int i = 0; i < tdm_pools[pool].size; i++)
+	tdm_emit (".word\t0");
+      return "";
+    }
+  for (int i = tdm_pool_start[pool]; i < tdm_pool_start[pool + 1]; i++)
+    if (!tdm_pool_entries[i].dead)
+      live++;
+  if (INTVAL (skip) && live)
+    tdm_emit ("mov\t$pc, $pc+%d", live + 1);
   for (int i = tdm_pool_start[pool]; i < tdm_pool_start[pool + 1]; i++)
     {
       const tdm_pool_entry &e = tdm_pool_entries[i];
@@ -1272,10 +1302,14 @@ tdm_insn_word (rtx_insn *insn)
   return INSN_ADDRESSES (INSN_UID (insn)) / 2;
 }
 
-/* When choosing a pool, the distance to it is taken from the addresses
-   before any literal moves.  Allow for some change; the distances are
-   checked once the pools are in place.  */
+/* When choosing a pool, the distance to it is estimated.  Allow for
+   some change; the distances are checked once the pools are in
+   place.  */
 #define TDM_POOL_MARGIN 2
+
+/* The most entries of a pool with a jump over it, which reaches 31
+   words.  */
+#define TDM_POOL_MAX 24
 
 /* A wide operand that may load its value from a pool.  */
 
@@ -1284,10 +1318,10 @@ struct tdm_pool_use
   rtx_insn *insn;
   /* Its index among the literals of INSN.  */
   int index;
-  /* Its word address before any literal moves, and its segment: code
-     between an asm statement or a section switch and the next one.  A
-     use and its pool must be in the same segment: the length of an asm
-     statement is only an estimate.  */
+  /* Its estimated word address, and its segment: code between an asm
+     statement or a section switch and the next one.  A use and its pool
+     must be in the same segment: the length of an asm statement is only
+     an estimate.  */
   int addr, seg;
   char text[TDM_LIT_LEN];
   /* Its pool, or -1, and its pool entry: first its position in the
@@ -1295,7 +1329,7 @@ struct tdm_pool_use
   int pool, entry;
 };
 
-/* A place for a pool: after a barrier.  */
+/* A place for a pool after a barrier.  */
 
 struct tdm_pool_site
 {
@@ -1305,9 +1339,52 @@ struct tdm_pool_site
   int pool;
 };
 
+/* Add pool SKIP before (or, if AFTER, after) WHERE.  */
+
+static int
+tdm_add_pool (vec<tdm_pool> *pools, rtx_insn *where, bool after, bool skip,
+	      int addr)
+{
+  int id = pools->length ();
+  rtx pat = gen_tdm_pool (GEN_INT (id), GEN_INT (skip));
+  rtx_insn *p = after ? emit_insn_after (pat, where)
+		      : emit_insn_before (pat, where);
+
+  if (!skip)
+    emit_barrier_after (p);
+  pools->safe_push ({p, 0, skip, addr});
+  return id;
+}
+
+/* Put use U in pool ID.  */
+
+static void
+tdm_pool_add_use (vec<tdm_pool> *pools, tdm_pool_use *u, int id)
+{
+  u->pool = id;
+  u->entry = (*pools)[id].size++;
+  tdm_lit_labels->put (std::make_pair (INSN_UID (u->insn), u->index),
+		       ++tdm_lit_label_no);
+}
+
+/* Whether the pending uses PENDING (indices into USES) would be out of
+   reach of a pool with a jump at ADDR.  */
+
+static bool
+tdm_pending_out_of_reach (const vec<tdm_pool_use> &uses,
+			  const vec<int> &pending, int addr)
+{
+  for (unsigned int j = 0; j < pending.length (); j++)
+    if (addr + 1 + (int) j - uses[pending[j]].addr > 31 - TDM_POOL_MARGIN)
+      return true;
+  return false;
+}
+
 /* Machine-dependent reorg: put the wide operands of the function in
-   pools after barriers, in reach of their uses (-32..31 words).  The
-   others stay inline.  The mach dump lists the literals and pools.  */
+   pools, in reach of their uses (-32..31 words).  A pool goes after a
+   barrier where there is one in reach, else in the middle of the code
+   with a jump over it.  Operands that end up out of reach stay inline.
+   The mach dump lists the literals and pools.  */
 
 static void
 tdm_reorg (void)
@@ -1316,10 +1393,10 @@ tdm_reorg (void)
   auto_vec<tdm_lit> lits;
   auto_vec<tdm_pool_use> uses;
   auto_vec<tdm_pool_site> sites;
-  auto_vec<rtx_insn *> pool_insns;
-  auto_vec<int> pool_size;
+  auto_vec<tdm_pool> &pools = tdm_pools;
   int n[3] = {}, nasm = 0, seg = 0, pooled = 0, reverted = 0;
 
+  tdm_pools.truncate (0);
   tdm_pool_entries.truncate (0);
   tdm_pool_start.truncate (0);
   if (tdm_lit_labels)
@@ -1375,7 +1452,7 @@ tdm_reorg (void)
     fprintf (dump_file, ";; literals: const %d jump %d cbranch %d, asm %d\n",
 	     n[LIT_CONST], n[LIT_JUMP], n[LIT_CBRANCH], nasm);
 
-  /* Give each use the nearest pool in reach.  */
+  /* Give each use the nearest pool after a barrier in reach.  */
   for (tdm_pool_use &u : uses)
     {
       tdm_pool_site *best = NULL;
@@ -1383,7 +1460,7 @@ tdm_reorg (void)
 
       for (tdm_pool_site &s : sites)
 	{
-	  int size = s.pool < 0 ? 0 : pool_size[s.pool];
+	  int size = s.pool < 0 ? 0 : pools[s.pool].size;
 	  int off = s.addr + size - u.addr;
 
 	  if (s.seg == u.seg
@@ -1397,25 +1474,116 @@ tdm_reorg (void)
       if (!best)
 	continue;
       if (best->pool < 0)
-	{
-	  best->pool = pool_size.length ();
-	  pool_size.safe_push (0);
-	  rtx_insn *p = emit_insn_after (gen_tdm_pool (GEN_INT (best->pool)),
-					 best->barrier);
-	  emit_barrier_after (p);
-	  pool_insns.safe_push (p);
-	}
-      u.pool = best->pool;
-      u.entry = pool_size[u.pool]++;
-      tdm_lit_labels->put (std::make_pair (INSN_UID (u.insn), u.index),
-			   ++tdm_lit_label_no);
+	best->pool = tdm_add_pool (&pools, best->barrier, true, false,
+				   best->addr);
+      tdm_pool_add_use (&pools, &u, best->pool);
       pooled++;
+    }
+  int barrier_pools = pools.length ();
+
+  /* The others: sweep through the code with the pools above in place,
+     keeping the uses not yet in a pool.  Before one of them would get
+     out of reach, put them in a pool with a jump over it, before the
+     labels in front of the next insn, so that only the fallthrough path
+     takes the jump; after a barrier, without one.  A later use can go
+     in that pool too while it's in reach.  SHIFT corrects the addresses
+     for the pools put in so far and for the uses that moved to one or
+     will (an inline literal is two words longer).  */
+  if (pooled < (int) uses.length ())
+    {
+      auto_vec<int> pending;
+      int forced = -1, shift = 0;
+      unsigned int ui = 0;
+      rtx_insn *point = NULL, *barrier = NULL;
+
+      shorten_branches (get_insns ());
+      auto flush = [&] (rtx_insn *where, int addr)
+	{
+	  if (pending.is_empty ())
+	    return;
+	  int id = (barrier
+		    ? tdm_add_pool (&pools, barrier, true, false, addr)
+		    : tdm_add_pool (&pools, point ? point : where, false, true,
+				    addr));
+	  for (int j : pending)
+	    tdm_pool_add_use (&pools, &uses[j], id);
+	  pooled += pending.length ();
+	  shift += pools[id].skip + pools[id].size;
+	  pending.truncate (0);
+	  forced = id;
+	};
+
+      for (rtx_insn *insn = get_insns (); insn; insn = NEXT_INSN (insn))
+	{
+	  if (LABEL_P (insn) && !point)
+	    point = insn;
+	  if (BARRIER_P (insn))
+	    barrier = insn;
+	  bool asm_p = (NONDEBUG_INSN_P (insn) && recog_memoized (insn) < 0
+			&& (asm_noperands (PATTERN (insn)) >= 0
+			    || GET_CODE (PATTERN (insn)) == ASM_INPUT));
+	  if (asm_p
+	      || (NOTE_P (insn)
+		  && NOTE_KIND (insn) == NOTE_INSN_SWITCH_TEXT_SECTIONS))
+	    {
+	      /* The end of a segment.  */
+	      flush (insn, tdm_insn_word (insn) + shift);
+	      forced = -1;
+	      point = barrier = NULL;
+	      continue;
+	    }
+	  if (!NONDEBUG_INSN_P (insn) || recog_memoized (insn) < 0)
+	    continue;
+
+	  int addr = tdm_insn_word (insn) + shift;
+	  int next = addr + get_attr_length (insn) / 2;
+	  if (pending.length () >= TDM_POOL_MAX
+	      || (!pending.is_empty ()
+		  && tdm_pending_out_of_reach (uses, pending, next)))
+	    flush (insn, addr);
+	  point = barrier = NULL;
+
+	  bool counted = false;
+	  for (; ui < uses.length () && uses[ui].insn == insn; ui++)
+	    {
+	      tdm_pool_use &u = uses[ui];
+	      if (u.pool >= 0)
+		continue;
+	      if (!counted)
+		{
+		  lits.truncate (0);
+		  tdm_count_insn (insn, &lits);
+		  counted = true;
+		}
+	      u.addr = tdm_insn_word (insn) + shift + lits[u.index].word;
+	      shift -= 2;
+	      if (forced >= 0
+		  && pools[forced].size < TDM_POOL_MAX
+		  && (pools[forced].addr + pools[forced].skip + pools[forced].size
+		      - u.addr >= -32 + TDM_POOL_MARGIN))
+		{
+		  tdm_pool_add_use (&pools, &u, forced);
+		  pooled++;
+		  shift++;
+		}
+	      else
+		pending.safe_push (ui);
+	    }
+	}
+      if (!pending.is_empty ())
+	{
+	  rtx_insn *last = get_last_insn ();
+	  tdm_add_pool (&pools, last, true, !BARRIER_P (last), 0);
+	  for (int j : pending)
+	    tdm_pool_add_use (&pools, &uses[j], pools.length () - 1);
+	  pooled += pending.length ();
+	}
     }
 
   /* Lay out the entries pool by pool, in the order of their uses.  */
   tdm_pool_start.safe_push (0);
-  for (int size : pool_size)
-    tdm_pool_start.safe_push (tdm_pool_start.last () + size);
+  for (const tdm_pool &p : pools)
+    tdm_pool_start.safe_push (tdm_pool_start.last () + p.size);
   tdm_pool_entries.safe_grow_cleared (tdm_pool_start.last ());
   for (tdm_pool_use &u : uses)
     if (u.pool >= 0)
@@ -1442,7 +1610,7 @@ tdm_reorg (void)
 	  lits.truncate (0);
 	  tdm_count_insn (u.insn, &lits);
 	  int from = tdm_insn_word (u.insn) + lits[u.index].word;
-	  int to = tdm_insn_word (pool_insns[u.pool]);
+	  int to = tdm_insn_word (pools[u.pool].insn) + pools[u.pool].skip;
 	  for (int e = tdm_pool_start[u.pool]; e < u.entry; e++)
 	    if (!tdm_pool_entries[e].dead)
 	      to++;
@@ -1464,9 +1632,9 @@ tdm_reorg (void)
 	if (u.pool >= 0)
 	  fprintf (dump_file, ";; pooled: insn %d literal %d in pool %d: %s\n",
 		   INSN_UID (u.insn), u.index, u.pool, u.text);
-      fprintf (dump_file, ";; pools %d, pooled %d, back inline %d, "
-	       "inline %d\n", (int) pool_size.length (), pooled, reverted,
-	       (int) uses.length () - pooled);
+      fprintf (dump_file, ";; pools %d (%d after barriers), pooled %d, "
+	       "back inline %d, inline %d\n", (int) pools.length (),
+	       barrier_pools, pooled, reverted, (int) uses.length () - pooled);
     }
 }
 
