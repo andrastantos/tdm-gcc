@@ -381,4 +381,7 @@ enum reg_class
 #define ASM_OUTPUT_ADDR_VEC_ELT(STREAM, VALUE) \
   fprintf ((STREAM), "\t.word\t.L%d\n", (VALUE))
 
+#define ADJUST_INSN_LENGTH(INSN, LENGTH) \
+  ((LENGTH) = tdm_adjust_insn_length ((INSN), (LENGTH)))
+
 #endif /* GCC_TDM_H */
