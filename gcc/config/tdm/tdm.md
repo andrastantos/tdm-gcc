@@ -249,7 +249,12 @@
 ;; first.  Register allocation would otherwise need a register for it
 ;; while $r0 is the address, and with the first operand in $r0 there
 ;; is none.  It is always a long branch.
-(define_insn "*cbranchhi4"
+;;
+;; The length attribute is the predicate and a short jump (4) or a skip
+;; over a long jump (8).  ADJUST_INSN_LENGTH adds what goes before the
+;; predicate (tdm_cbranch_prefix_length): genattrtab can't bound a
+;; symbol_ref, which would leave the minimum length unknown.
+(define_insn "tdm_cbranchhi4"
   [(set (pc)
 	(if_then_else (match_operator 0 "tdm_cbranch_operator"
 			[(match_operand:HI 1 "register_operand" "q,?t")
@@ -259,12 +264,12 @@
   ""
   "* return tdm_output_cbranch (operands, insn);"
   [(set (attr "length")
-	(cond [(eq_attr "alternative" "1")
-		 (const_int 30)
+	(if_then_else
+	  (and (eq_attr "alternative" "0")
 	       (and (ge (minus (match_dup 3) (pc)) (const_int -56))
-		    (le (minus (match_dup 3) (pc)) (const_int 56)))
-		 (const_int 6)]
-	      (const_int 10)))])
+		    (le (minus (match_dup 3) (pc)) (const_int 56))))
+	  (const_int 4)
+	  (const_int 8)))])
 
 (define_insn "jump"
   [(set (pc) (label_ref (match_operand 0)))]

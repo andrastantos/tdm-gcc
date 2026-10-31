@@ -1011,16 +1011,16 @@ tdm_condition_name (enum rtx_code code)
 }
 
 /* Branches: a predicate instruction, then a jump.  A far branch skips
-   over a long jump with the inverted condition.  */
+   over a long jump with the inverted condition.
 
-const char *
-tdm_output_cbranch (rtx *operands, rtx_insn *insn)
+   Emit what a cbranch needs before its predicate, and return the
+   operand the predicate compares the register operand with.  */
+
+static tdm_loc
+tdm_cbranch_operand (rtx *operands)
 {
-  enum rtx_code code = GET_CODE (operands[0]);
   tdm_loc a = tdm_classify (operands[1]);
   tdm_loc b = tdm_classify (operands[2]);
-  bool far = get_attr_length (insn) > 6;
-  char lab[32];
 
   gcc_assert (tdm_reg_loc_p (a));
   if (tdm_wrap_p (b) || tdm_far_p (b))
@@ -1043,6 +1043,52 @@ tdm_output_cbranch (rtx *operands, rtx_insn *insn)
       tdm_emit ("mov\t[$sp-1], $r1");
       b = tdm_make_loc (LOC_SCRATCH);
     }
+  return b;
+}
+
+/* The length in octets of what tdm_cbranch_operand emits for INSN.  */
+
+static int
+tdm_cbranch_prefix_length (rtx_insn *insn)
+{
+  bool counting = tdm_counting;
+  int words = tdm_words;
+  std::vector<tdm_lit> *lits = tdm_lits;
+  int n;
+
+  if (!reload_completed)
+    return 2;
+  extract_constrain_insn_cached (insn);
+  tdm_counting = true;
+  tdm_words = 0;
+  tdm_lits = NULL;
+  tdm_cbranch_operand (recog_data.operand);
+  n = tdm_words;
+  tdm_counting = counting;
+  tdm_words = words;
+  tdm_lits = lits;
+  return n * 2;
+}
+
+/* ADJUST_INSN_LENGTH: add the cbranch prefix to the LENGTH of INSN.  */
+
+int
+tdm_adjust_insn_length (rtx_insn *insn, int length)
+{
+  if (INSN_P (insn) && recog_memoized (insn) == CODE_FOR_tdm_cbranchhi4)
+    length += tdm_cbranch_prefix_length (insn);
+  return length;
+}
+
+const char *
+tdm_output_cbranch (rtx *operands, rtx_insn *insn)
+{
+  enum rtx_code code = GET_CODE (operands[0]);
+  tdm_loc a = tdm_classify (operands[1]);
+  tdm_loc b = tdm_cbranch_operand (operands);
+  bool far = get_attr_length (insn) - tdm_cbranch_prefix_length (insn) > 4;
+  char lab[32];
+
   if (far)
     code = reverse_condition (code);
   tdm_label_text (operands[3], lab, sizeof lab);
