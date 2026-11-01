@@ -439,15 +439,13 @@ tdm_sorry (const char *msg)
     sorry ("%s", msg);
 }
 
-/* Emit OP with the word WORD as second operand, from a literal that
-   the code jumps over.  A "mov $pc" loads the literal directly, as
-   KIND, which is LIT_JUMP or LIT_CBRANCH.  */
+/* The pool label of the next literal of the insn being counted or
+   output, or -1 if it is inline.  If ADVANCE, move on to the one after
+   it.  */
 
-static void
-tdm_emit_literal (const char *op, const char *dest, const char *word,
-		  enum tdm_lit_kind kind = LIT_JUMP)
+static int
+tdm_next_literal_label (bool advance)
 {
-  bool jump = strcmp (op, "mov") == 0 && strcmp (dest, "$pc") == 0;
   int label = -1;
 
   if (!tdm_counting && current_output_insn != tdm_lit_insn)
@@ -461,8 +459,31 @@ tdm_emit_literal (const char *op, const char *dest, const char *word,
 	if (int *l = tdm_lit_labels->get (std::make_pair (INSN_UID (tdm_lit_insn),
 							   tdm_lit_index)))
 	  label = *l;
-      tdm_lit_index++;
+      if (advance)
+	tdm_lit_index++;
     }
+  return label;
+}
+
+/* Whether literal INDEX of INSN is in a pool.  */
+
+static bool
+tdm_literal_pooled_p (rtx_insn *insn, int index)
+{
+  return (tdm_lit_labels
+	  && tdm_lit_labels->get (std::make_pair (INSN_UID (insn), index)));
+}
+
+/* Emit OP with the word WORD as second operand, from a literal that
+   the code jumps over.  A "mov $pc" loads the literal directly, as
+   KIND, which is LIT_JUMP or LIT_CBRANCH.  */
+
+static void
+tdm_emit_literal (const char *op, const char *dest, const char *word,
+		  enum tdm_lit_kind kind = LIT_JUMP)
+{
+  bool jump = strcmp (op, "mov") == 0 && strcmp (dest, "$pc") == 0;
+  int label = tdm_next_literal_label (true);
 
   if (tdm_lits)
     {
@@ -1105,10 +1126,11 @@ tdm_cbranch_operand (rtx *operands)
   return b;
 }
 
-/* The length in octets of what tdm_cbranch_operand emits for INSN.  */
+/* The length in octets of what tdm_cbranch_operand emits for INSN.
+   Set *NLITS, if given, to the number of literals in it.  */
 
 static int
-tdm_cbranch_prefix_length (rtx_insn *insn)
+tdm_cbranch_prefix_length (rtx_insn *insn, int *nlits = NULL)
 {
   bool counting = tdm_counting;
   int words = tdm_words;
@@ -1117,6 +1139,8 @@ tdm_cbranch_prefix_length (rtx_insn *insn)
   int lit_index = tdm_lit_index;
   int n;
 
+  if (nlits)
+    *nlits = 0;
   if (!reload_completed)
     return 2;
   extract_constrain_insn_cached (insn);
@@ -1129,6 +1153,8 @@ tdm_cbranch_prefix_length (rtx_insn *insn)
   tdm_lit_index = 0;
   tdm_cbranch_operand (recog_data.operand);
   n = tdm_words;
+  if (nlits)
+    *nlits = tdm_lit_index;
   tdm_counting = counting;
   tdm_words = words;
   tdm_lits = lits;
@@ -1137,15 +1163,33 @@ tdm_cbranch_prefix_length (rtx_insn *insn)
   return n * 2;
 }
 
-/* ADJUST_INSN_LENGTH: add the cbranch prefix to the LENGTH of INSN.  */
+/* ADJUST_INSN_LENGTH for INSN with length attribute LENGTH: add the
+   cbranch prefix.  A jump or cbranch whose target is in a pool always
+   loads it from there, near or far, and is as long as a near one.  */
 
 int
 tdm_adjust_insn_length (rtx_insn *insn, int length)
 {
-  if (INSN_P (insn) && recog_memoized (insn) == CODE_FOR_tdm_cbranchhi4)
-    length += tdm_cbranch_prefix_length (insn);
+  if (!INSN_P (insn))
+    return length;
+  int code = recog_memoized (insn);
+  if (code == CODE_FOR_tdm_cbranchhi4)
+    {
+      int nlits;
+      int prefix = tdm_cbranch_prefix_length (insn, &nlits);
+      if (tdm_literal_pooled_p (insn, nlits))
+	length = 4;
+      length += prefix;
+    }
+  else if (code == CODE_FOR_jump && tdm_literal_pooled_p (insn, 0))
+    length = 2;
   return length;
 }
+
+/* Output a conditional branch: the predicate, then a short jump, a
+   jump loading the target from its pool, or for a far target that
+   isn't in a pool, a skip over a long jump with the inverted
+   condition.  */
 
 const char *
 tdm_output_cbranch (rtx *operands, rtx_insn *insn)
@@ -1153,7 +1197,9 @@ tdm_output_cbranch (rtx *operands, rtx_insn *insn)
   enum rtx_code code = GET_CODE (operands[0]);
   tdm_loc a = tdm_classify (operands[1]);
   tdm_loc b = tdm_cbranch_operand (operands);
-  bool far = get_attr_length (insn) - tdm_cbranch_prefix_length (insn) > 4;
+  bool pooled = tdm_next_literal_label (false) >= 0;
+  bool far = (!pooled
+	      && get_attr_length (insn) - tdm_cbranch_prefix_length (insn) > 4);
   char lab[32];
 
   if (far)
@@ -1161,7 +1207,9 @@ tdm_output_cbranch (rtx *operands, rtx_insn *insn)
   tdm_label_text (operands[3], lab, sizeof lab);
   tdm_emit ("if_%s\t%s, %s", tdm_condition_name (code), tdm_reg_text (a),
 	    tdm_opb_text (b));
-  if (!far)
+  if (pooled)
+    tdm_emit_literal ("mov", "$pc", lab, LIT_CBRANCH);
+  else if (!far)
     tdm_emit ("mov\t$pc, $pc+(%s-.)", lab);
   else
     {
@@ -1177,7 +1225,7 @@ tdm_output_jump (rtx label, rtx_insn *insn)
   char lab[32];
 
   tdm_label_text (label, lab, sizeof lab);
-  if (get_attr_length (insn) > 2)
+  if (tdm_next_literal_label (false) >= 0 || get_attr_length (insn) > 2)
     tdm_emit_literal ("mov", "$pc", lab);
   else
     tdm_emit ("mov\t$pc, $pc+(%s-.)", lab);
@@ -1332,10 +1380,19 @@ struct tdm_pool_use
   char text[TDM_LIT_LEN];
   /* Its pool entry (see tdm_pool_builder), or -1.  */
   int ent;
-  /* Whether it took an entry again after going back inline: it only
-     does once.  */
-  bool rejoined;
+  /* The words it saves in a pool.  */
+  int save;
 };
+
+/* The words saved by putting a literal of KIND in a pool: a wide
+   operand isn't jumped over, a far jump loads its target directly, and
+   a far cbranch doesn't skip over a long jump.  */
+
+static int
+tdm_pool_saving (enum tdm_lit_kind kind)
+{
+  return kind == LIT_JUMP ? 1 : 2;
+}
 
 /* A place for a pool: after a barrier.  */
 
@@ -1409,11 +1466,13 @@ int
 tdm_pool_builder::new_entry (tdm_pool_use *u, int pool)
 {
   int id = m_ents.length ();
-  tdm_pool_ent e = { -1, -1, u->text, ++tdm_lit_label_no, 0, u->addr,
-		     lookup (u->text) };
+  /* Uses are added after the sweep: keep the text elsewhere.  */
+  const char *text = ggc_strdup (u->text);
+  tdm_pool_ent e = { -1, -1, text, ++tdm_lit_label_no, 0, u->addr,
+		     lookup (text) };
 
   m_ents.safe_push (e);
-  m_last.put (u->text, id);
+  m_last.put (text, id);
   if (pool >= 0)
     place (id, pool);
   join (u, id);
@@ -1464,6 +1523,8 @@ tdm_pool_reach (const tdm_pool_use &u, int flat, const tdm_pool &p)
   int pool = INTVAL (XVECEXP (PATTERN (p.insn), 0, 0));
 
   tdm_count_insn (u.insn, &lits);
+  if (u.index >= (int) lits.length ())
+    return INT_MAX;
   int from = tdm_insn_word (u.insn) + lits[u.index].word;
   int to = tdm_insn_word (p.insn) + p.skip;
   for (int e = tdm_pool_start[pool]; e < flat; e++)
@@ -1537,13 +1598,11 @@ tdm_reorg (void)
 	  if (dump_file)
 	    fprintf (dump_file, ";; literal %s: insn %d, word %d: %s\n",
 		     kinds[l.kind], INSN_UID (insn), addr, l.text);
-	  if (l.kind == LIT_CONST)
-	    {
-	      tdm_pool_use u = { insn, (int) i, addr - shrink, seg, "", -1, false };
-	      snprintf (u.text, sizeof u.text, "%s", l.text);
-	      uses.safe_push (u);
-	      shrink += 2;
-	    }
+	  tdm_pool_use u = { insn, (int) i, addr - shrink, seg, "", -1,
+			     tdm_pool_saving (l.kind) };
+	  snprintf (u.text, sizeof u.text, "%s", l.text);
+	  uses.safe_push (u);
+	  shrink += u.save;
 	}
     }
   if (dump_file)
@@ -1684,8 +1743,12 @@ tdm_reorg (void)
 		  tdm_count_insn (insn, &lits);
 		  counted = true;
 		}
+	      /* A branch that the pools above brought in reach of its
+		 target has no literal any more.  */
+	      if (u.index >= (int) lits.length ())
+		continue;
 	      u.addr = tdm_insn_word (insn) + shift + lits[u.index].word;
-	      shift -= 2;
+	      shift -= u.save;
 	      pooled++;
 
 	      int ent = -1;
@@ -1751,6 +1814,7 @@ tdm_reorg (void)
      drops uses, and entries without any.  Then let the inline uses take
      a live entry with their value in reach: that only makes the code
      shorter, which leaves the others in reach, but check again.  */
+  hash_set<tdm_lit_key_hash> tried;
   for (bool check = pooled > 0; check; )
     {
       for (bool changed = true; changed; )
@@ -1776,24 +1840,51 @@ tdm_reorg (void)
 	    }
 	}
 
+      /* Every inline literal: one that went back inline, or a branch
+	 that became far.  */
       check = false;
-      for (tdm_pool_use &u : uses)
+      seg = 0;
+      for (rtx_insn *insn = get_insns (); insn; insn = NEXT_INSN (insn))
 	{
-	  if (u.ent >= 0 || u.rejoined)
+	  if (NOTE_P (insn)
+	      && NOTE_KIND (insn) == NOTE_INSN_SWITCH_TEXT_SECTIONS)
+	    seg++;
+	  if (!NONDEBUG_INSN_P (insn))
 	    continue;
-	  for (int e = b.lookup (u.text); e >= 0; e = b.m_ents[e].prev)
+	  if (recog_memoized (insn) < 0)
 	    {
-	      tdm_pool_ent &x = b.m_ents[e];
-	      int flat = tdm_pool_start[x.pool] + x.pos;
-	      if (tdm_pool_entries[flat].dead
-		  || tdm_pool_reach (u, flat, pools[x.pool]) != 0)
+	      if (asm_noperands (PATTERN (insn)) >= 0
+		  || GET_CODE (PATTERN (insn)) == ASM_INPUT)
+		seg++;
+	      continue;
+	    }
+	  if (INSN_CODE (insn) == CODE_FOR_tdm_pool)
+	    continue;
+	  lits.truncate (0);
+	  tdm_count_insn (insn, &lits);
+	  for (unsigned int i = 0; i < lits.length (); i++)
+	    {
+	      auto key = std::make_pair (INSN_UID (insn), (int) i);
+	      if (tdm_lit_labels->get (key) || tried.add (key))
 		continue;
-	      b.join (&u, e);
-	      u.rejoined = true;
-	      pooled++;
-	      rejoined++;
-	      check = true;
-	      break;
+	      tdm_pool_use u = { insn, (int) i, 0, seg, "", -1,
+				 tdm_pool_saving (lits[i].kind) };
+	      snprintf (u.text, sizeof u.text, "%s", lits[i].text);
+	      for (int e = b.lookup (u.text); e >= 0; e = b.m_ents[e].prev)
+		{
+		  tdm_pool_ent &x = b.m_ents[e];
+		  int flat = tdm_pool_start[x.pool] + x.pos;
+		  if (tdm_pool_entries[flat].dead
+		      || pools[x.pool].seg != seg
+		      || tdm_pool_reach (u, flat, pools[x.pool]) != 0)
+		    continue;
+		  b.join (&u, e);
+		  uses.safe_push (u);
+		  pooled++;
+		  rejoined++;
+		  check = true;
+		  break;
+		}
 	    }
 	}
     }
