@@ -194,12 +194,12 @@ static GTY(()) section *debug_frame_section;
 #define DWARF_INITIAL_LENGTH_SIZE_STR (dwarf_offset_size == 4 ? "-4" : "-12")
 #endif
 
-/* The unit of the offsets from the stack pointer and the frame base in
-   location expressions, in bytes.  It differs from 1 on targets whose
-   debuggers see the stack pointer in larger units than the compiler's
-   stack offsets.  */
-#ifndef DWARF_STACK_UNIT_SIZE
-#define DWARF_STACK_UNIT_SIZE 1
+/* The unit of addresses in location expressions, in bytes.  It differs
+   from 1 on targets whose debuggers see memory in larger units than the
+   compiler's byte addresses: the stack pointer, the frame pointers, code
+   addresses and DW_OP_addr are in units, data pointers count bytes.  */
+#ifndef DWARF_ADDR_UNIT_SIZE
+#define DWARF_ADDR_UNIT_SIZE 1
 #endif
 
 /* Round SIZE up to the nearest BOUNDARY.  */
@@ -15189,7 +15189,7 @@ address_of_int_loc_descriptor (int size, HOST_WIDE_INT i)
 }
 
 /* Convert *OFFSET, a byte offset from the stack pointer or the frame
-   base, to the units of DWARF_STACK_UNIT_SIZE.  Return false if it
+   base, to the units of DWARF_ADDR_UNIT_SIZE.  Return false if it
    isn't a whole number of units.  */
 
 static bool
@@ -15197,13 +15197,117 @@ stack_offset_to_dwarf_units (poly_int64 *offset)
 {
   HOST_WIDE_INT const_offset;
 
-  if (DWARF_STACK_UNIT_SIZE == 1)
+  if (DWARF_ADDR_UNIT_SIZE == 1)
     return true;
   if (!offset->is_constant (&const_offset)
-      || const_offset % DWARF_STACK_UNIT_SIZE != 0)
+      || const_offset % DWARF_ADDR_UNIT_SIZE != 0)
     return false;
-  *offset = const_offset / DWARF_STACK_UNIT_SIZE;
+  *offset = const_offset / DWARF_ADDR_UNIT_SIZE;
   return true;
+}
+
+/* Whether REG holds an address in the units of DWARF_ADDR_UNIT_SIZE
+   rather than a byte address: the stack pointer and the frame
+   pointers.  */
+
+static bool
+dwarf_unit_address_reg_p (rtx reg)
+{
+  if (DWARF_ADDR_UNIT_SIZE == 1 || !REG_P (reg))
+    return false;
+  unsigned int regno = REGNO (reg);
+  return (regno == STACK_POINTER_REGNUM
+	  || regno == ARG_POINTER_REGNUM
+	  || regno == FRAME_POINTER_REGNUM
+	  || (regno == HARD_FRAME_POINTER_REGNUM && frame_pointer_needed));
+}
+
+/* Whether the constant address X is a code address (a function or a
+   label), which is in DWARF_ADDR_UNIT_SIZE units like the addresses of
+   location expressions, rather than a byte address.  */
+
+static bool
+dwarf_code_address_p (rtx x)
+{
+  poly_int64 offset;
+  x = strip_offset (x, &offset);
+  return (LABEL_REF_P (x)
+	  || (SYMBOL_REF_P (x) && SYMBOL_REF_FUNCTION_P (x)));
+}
+
+/* Make *LOC, which computes an address in DWARF_ADDR_UNIT_SIZE units,
+   compute the byte address the compiler sees instead.  */
+
+static void
+loc_descr_units_to_bytes (dw_loc_descr_ref *loc)
+{
+  if (DWARF_ADDR_UNIT_SIZE == 1)
+    return;
+  int shift = exact_log2 (DWARF_ADDR_UNIT_SIZE);
+  gcc_assert (shift > 0);
+  add_loc_descr (loc, int_loc_descriptor (shift));
+  add_loc_descr (loc, new_loc_descr (DW_OP_shl, 0, 0));
+}
+
+/* The reverse of loc_descr_units_to_bytes: make *LOC, which computes a
+   byte address, compute the address in DWARF_ADDR_UNIT_SIZE units.  A
+   conversion to bytes at the end of *LOC, possibly followed by an
+   offset of whole units, is undone instead.  */
+
+static void
+loc_descr_bytes_to_units (dw_loc_descr_ref *loc)
+{
+  if (DWARF_ADDR_UNIT_SIZE == 1 || *loc == NULL)
+    return;
+  int shift = exact_log2 (DWARF_ADDR_UNIT_SIZE);
+  gcc_assert (shift > 0);
+
+  /* Find the last three operations.  */
+  dw_loc_descr_ref *p1 = NULL, *p2 = NULL, *p3 = loc;
+  for (dw_loc_descr_ref *p = loc; *p; p = &(*p)->dw_loc_next)
+    {
+      p1 = p2;
+      p2 = p3;
+      p3 = p;
+    }
+  dw_loc_descr_ref last = *p3;
+  if (last->dw_loc_opc == DW_OP_shl
+      && p2 != p3
+      && (*p2)->dw_loc_opc == DW_OP_lit0 + shift)
+    {
+      *p2 = NULL;
+      return;
+    }
+  if (last->dw_loc_opc == DW_OP_plus_uconst
+      && last->dw_loc_oprnd1.v.val_unsigned % DWARF_ADDR_UNIT_SIZE == 0
+      && p1 != NULL && p1 != p2 && p2 != p3
+      && (*p2)->dw_loc_opc == DW_OP_shl
+      && (*p1)->dw_loc_opc == DW_OP_lit0 + shift)
+    {
+      last->dw_loc_oprnd1.v.val_unsigned /= DWARF_ADDR_UNIT_SIZE;
+      *p1 = last;
+      return;
+    }
+  add_loc_descr (loc, int_loc_descriptor (shift));
+  add_loc_descr (loc, new_loc_descr (DW_OP_shr, 0, 0));
+}
+
+/* Apply loc_descr_units_to_bytes to each expression of LIST.  */
+
+static void
+loc_list_units_to_bytes (dw_loc_list_ref list)
+{
+  for (; list; list = list->dw_loc_next)
+    loc_descr_units_to_bytes (&list->expr);
+}
+
+/* Apply loc_descr_bytes_to_units to each expression of LIST.  */
+
+static void
+loc_list_bytes_to_units (dw_loc_list_ref list)
+{
+  for (; list; list = list->dw_loc_next)
+    loc_descr_bytes_to_units (&list->expr);
 }
 
 /* Return a location descriptor that designates a base+offset location.  */
@@ -16462,7 +16566,13 @@ mem_loc_descriptor (rtx rtl, machine_mode mode,
 	 memory) so DWARF consumers need to be aware of the subtle
 	 distinction between OP_REG and OP_BASEREG.  */
       if (REGNO (rtl) < FIRST_PSEUDO_REGISTER)
-	mem_loc_result = based_loc_descr (rtl, 0, VAR_INIT_STATUS_INITIALIZED);
+	{
+	  mem_loc_result = based_loc_descr (rtl, 0,
+					    VAR_INIT_STATUS_INITIALIZED);
+	  /* The value is the byte address.  */
+	  if (mem_loc_result && dwarf_unit_address_reg_p (rtl))
+	    loc_descr_units_to_bytes (&mem_loc_result);
+	}
       else if (stack_realign_drap
 	       && crtl->drap_reg
 	       && crtl->args.internal_arg_pointer == rtl
@@ -16551,6 +16661,8 @@ mem_loc_descriptor (rtx rtl, machine_mode mode,
       mem_loc_result = mem_loc_descriptor (XEXP (rtl, 0),
 					   get_address_mode (rtl), mode,
 					   VAR_INIT_STATUS_INITIALIZED);
+      /* The address of the memory is in units.  */
+      loc_descr_bytes_to_units (&mem_loc_result);
       if (mem_loc_result == NULL)
 	mem_loc_result = tls_mem_loc_descriptor (rtl);
       if (mem_loc_result != NULL)
@@ -16690,6 +16802,18 @@ mem_loc_descriptor (rtx rtl, machine_mode mode,
 	}
 
     symref:
+      if (DWARF_ADDR_UNIT_SIZE != 1 && !dwarf_code_address_p (rtl))
+	{
+	  /* DW_OP_addr gives the address of the symbol in units; the
+	     value is the byte address, plus the offset in bytes.  */
+	  poly_int64 offset;
+	  rtx base = strip_offset (rtl, &offset);
+	  mem_loc_result = new_addr_loc_descr (base, dtprel_false);
+	  vec_safe_push (used_rtx_array, base);
+	  loc_descr_units_to_bytes (&mem_loc_result);
+	  loc_descr_plus_const (&mem_loc_result, offset);
+	  break;
+	}
       mem_loc_result = new_addr_loc_descr (rtl, dtprel_false);
       vec_safe_push (used_rtx_array, rtl);
       break;
@@ -16766,9 +16890,25 @@ mem_loc_descriptor (rtx rtl, machine_mode mode,
 	  && (GET_MODE_SIZE (int_mode) <= DWARF2_ADDR_SIZE
 	      || XEXP (rtl, 0) == arg_pointer_rtx
 	      || XEXP (rtl, 0) == frame_pointer_rtx))
-	mem_loc_result = based_loc_descr (XEXP (rtl, 0),
-					  INTVAL (XEXP (rtl, 1)),
-					  VAR_INIT_STATUS_INITIALIZED);
+	{
+	  HOST_WIDE_INT offset = INTVAL (XEXP (rtl, 1));
+	  if (dwarf_unit_address_reg_p (XEXP (rtl, 0)))
+	    {
+	      /* The value is a byte address: convert the base, and add the
+		 offset in units if it's a whole number of them.  */
+	      HOST_WIDE_INT rem = offset % DWARF_ADDR_UNIT_SIZE;
+	      mem_loc_result = based_loc_descr (XEXP (rtl, 0), offset - rem,
+						VAR_INIT_STATUS_INITIALIZED);
+	      if (mem_loc_result)
+		{
+		  loc_descr_units_to_bytes (&mem_loc_result);
+		  loc_descr_plus_const (&mem_loc_result, rem);
+		}
+	    }
+	  else
+	    mem_loc_result = based_loc_descr (XEXP (rtl, 0), offset,
+					      VAR_INIT_STATUS_INITIALIZED);
+	}
       else
 	{
 	  mem_loc_result = mem_loc_descriptor (XEXP (rtl, 0), mode, mem_mode,
@@ -17526,6 +17666,8 @@ loc_descriptor (rtx rtl, machine_mode mode,
     case MEM:
       loc_result = mem_loc_descriptor (XEXP (rtl, 0), get_address_mode (rtl),
 				       GET_MODE (rtl), initialized);
+      /* The address of the memory is in units.  */
+      loc_descr_bytes_to_units (&loc_result);
       if (loc_result == NULL)
 	loc_result = tls_mem_loc_descriptor (rtl);
       if (loc_result == NULL)
@@ -17837,6 +17979,8 @@ dw_loc_list_1 (tree loc, rtx varloc, int want_address,
 	      rtx addr = XEXP (varloc, 0);
 	      descr = mem_loc_descriptor (addr, get_address_mode (varloc),
 					  mode, initialized);
+	      /* The address of the memory is in units.  */
+	      loc_descr_bytes_to_units (&descr);
 	      if (descr)
 		have_address = 1;
 	      else
@@ -19091,6 +19235,9 @@ loc_list_from_tree_1 (tree loc, int want_address,
   dw_loc_descr_ref ret = NULL, ret1 = NULL;
   dw_loc_list_ref list_ret = NULL, list_ret1 = NULL;
   int have_address = 0;
+  /* Whether the address is the value of a pointer, a byte address (see
+     DWARF_ADDR_UNIT_SIZE).  */
+  bool pointer_address = false;
   enum dwarf_location_atom op;
 
   /* ??? Most of the time we do not take proper care for sign/zero
@@ -19217,9 +19364,13 @@ loc_list_from_tree_1 (tree loc, int want_address,
 	  	   && (ret = cst_pool_loc_descr (loc)))
 	    have_address = 1;
 	}
-        /* Otherwise, process the argument and look for the address.  */
+        /* Otherwise, process the argument and look for the address.  The
+	 value is the byte address.  */
       if (!list_ret && !ret)
-        list_ret = loc_list_from_tree_1 (TREE_OPERAND (loc, 0), 1, context);
+	{
+	  list_ret = loc_list_from_tree_1 (TREE_OPERAND (loc, 0), 1, context);
+	  loc_list_units_to_bytes (list_ret);
+	}
       else
 	{
 	  if (want_address)
@@ -19413,6 +19564,9 @@ loc_list_from_tree_1 (tree loc, int want_address,
 		  }
 		ret = mem_loc_descriptor (rtl, mode, mem_mode,
 					  VAR_INIT_STATUS_INITIALIZED);
+		/* The address of the memory is in units.  */
+		if (have_address)
+		  loc_descr_bytes_to_units (&ret);
 	      }
 	    if (!ret)
 	      expansion_failed (loc, rtl,
@@ -19425,12 +19579,14 @@ loc_list_from_tree_1 (tree loc, int want_address,
       if (!integer_zerop (TREE_OPERAND (loc, 1)))
 	{
 	  have_address = 1;
+	  pointer_address = true;
 	  goto do_plus;
 	}
       /* Fallthru.  */
     case INDIRECT_REF:
       list_ret = loc_list_from_tree_1 (TREE_OPERAND (loc, 0), 0, context);
       have_address = 1;
+      pointer_address = true;
       break;
 
     case TARGET_MEM_REF:
@@ -19482,6 +19638,17 @@ loc_list_from_tree_1 (tree loc, int want_address,
 	    return 0;
 	  }
 
+	/* The offsets count bytes: add them to the byte address.  A
+	   constant offset inside a unit has no address in units.  */
+	bool offsets = offset != NULL_TREE || maybe_ne (bytepos, 0);
+	if (offsets && !offset && !multiple_p (bytepos, DWARF_ADDR_UNIT_SIZE))
+	  {
+	    expansion_failed (loc, NULL_RTX, "offset inside an address unit");
+	    return 0;
+	  }
+	if (offsets)
+	  loc_list_units_to_bytes (list_ret);
+
 	if (offset != NULL_TREE)
 	  {
 	    /* Variable offset.  */
@@ -19501,6 +19668,8 @@ loc_list_from_tree_1 (tree loc, int want_address,
 	else if (maybe_ne (bytepos, 0))
 	  loc_list_plus_const (list_ret, bytepos);
 
+	if (offsets)
+	  loc_list_bytes_to_units (list_ret);
 	have_address = 1;
 	break;
       }
@@ -19979,6 +20148,13 @@ loc_list_from_tree_1 (tree loc, int want_address,
 
   if (!ret && !list_ret)
     return 0;
+
+  /* The value of a pointer used as an address: in units.  */
+  if (pointer_address)
+    {
+      loc_descr_bytes_to_units (&ret);
+      loc_list_bytes_to_units (list_ret);
+    }
 
   /* Implement wrap-around arithmetics for small integer types.  */
   if ((TREE_CODE (loc) == PLUS_EXPR
@@ -24702,6 +24878,8 @@ gen_subprogram_die (tree decl, dw_die_ref context_die)
 						get_address_mode (mem),
 						GET_MODE (mem),
 						VAR_INIT_STATUS_INITIALIZED);
+		      /* The address of the memory is in units.  */
+		      loc_descr_bytes_to_units (&reg);
 		    }
 		  else if (GET_CODE (XEXP (XEXP (arg, 0), 0))
 			   == DEBUG_PARAMETER_REF)
