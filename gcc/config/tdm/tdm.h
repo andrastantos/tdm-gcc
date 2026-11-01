@@ -309,9 +309,10 @@ enum reg_class
 #define DWARF_CIE_DATA_ALIGNMENT (-1)
 
 /* The CFA is where the argument pointer points, and the frame base is
-   the CFA.  Location expressions count stack offsets in words too.  */
+   the CFA.  Location expressions count addresses and stack offsets in
+   words too; data pointers are byte addresses.  */
 #define ARG_POINTER_CFA_OFFSET(FNDECL) 0
-#define DWARF_STACK_UNIT_SIZE UNITS_PER_WORD
+#define DWARF_ADDR_UNIT_SIZE UNITS_PER_WORD
 
 #define HAS_LONG_COND_BRANCH true
 #define HAS_LONG_UNCOND_BRANCH true
