@@ -2378,8 +2378,14 @@ tdm_expand_prologue (void)
     }
 }
 
+/* Restore the registers and $sp, then return.  For a sibling call
+   (SIBCALL), stop before the return: $sp is back where it was on entry,
+   with the return address in [$sp], and the stack arguments of the
+   callee, which the caller stored over its own, follow it, as at a
+   call.  The callee returns to the caller's caller.  */
+
 void
-tdm_expand_epilogue (void)
+tdm_expand_epilogue (bool sibcall)
 {
   tdm_frame_info f;
   HOST_WIDE_INT off;
@@ -2418,7 +2424,8 @@ tdm_expand_epilogue (void)
       emit_insn (gen_blockage ());
       tdm_emit_sp_adjust (f.total);
     }
-  emit_jump_insn (gen_return_internal ());
+  if (!sibcall)
+    emit_jump_insn (gen_return_internal ());
 }
 
 /* Registers.  */
@@ -2794,6 +2801,10 @@ tdm_init_libfuncs (void)
 #define TARGET_FUNCTION_VALUE_REGNO_P tdm_function_value_regno_p
 #undef  TARGET_RETURN_IN_MEMORY
 #define TARGET_RETURN_IN_MEMORY tdm_return_in_memory
+/* A sibling call leaves the return address where the caller found it,
+   in [$sp] (see tdm_expand_epilogue): any call can be one.  */
+#undef  TARGET_FUNCTION_OK_FOR_SIBCALL
+#define TARGET_FUNCTION_OK_FOR_SIBCALL hook_bool_tree_tree_true
 
 #undef  TARGET_PRINT_OPERAND
 #define TARGET_PRINT_OPERAND tdm_print_operand

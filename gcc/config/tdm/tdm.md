@@ -328,6 +328,50 @@
   ""
   "* return tdm_output_call (operands[1]);")
 
+;; A sibling call jumps to the callee after the epilogue, which leaves
+;; the return address in [$sp] (see tdm_expand_epilogue).  The target
+;; of an indirect one is in $r1, which the epilogue keeps, like $r0
+;; with the first argument: both hold return values in the other
+;; epilogues.
+
+(define_expand "sibcall"
+  [(parallel [(call (match_operand:HI 0 "")
+		    (match_operand 1 ""))
+	      (return)])]
+  ""
+{
+  rtx addr = XEXP (operands[0], 0);
+  if (!call_address_operand (addr, Pmode))
+    operands[0] = gen_rtx_MEM (HImode, force_reg (Pmode, addr));
+})
+
+(define_insn "*sibcall"
+  [(call (mem:HI (match_operand:HI 0 "call_address_operand" "t,i"))
+	 (match_operand 1 ""))
+   (return)]
+  ""
+  "* return tdm_output_indirect_jump (operands[0]);")
+
+(define_expand "sibcall_value"
+  [(parallel [(set (match_operand 0 "")
+		   (call (match_operand:HI 1 "")
+			 (match_operand 2 "")))
+	      (return)])]
+  ""
+{
+  rtx addr = XEXP (operands[1], 0);
+  if (!call_address_operand (addr, Pmode))
+    operands[1] = gen_rtx_MEM (HImode, force_reg (Pmode, addr));
+})
+
+(define_insn "*sibcall_value"
+  [(set (match_operand 0 "register_operand" "=r,r")
+	(call (mem:HI (match_operand:HI 1 "call_address_operand" "t,i"))
+	      (match_operand 2 "")))
+   (return)]
+  ""
+  "* return tdm_output_indirect_jump (operands[1]);")
+
 ;; -------------------------------------------------------------------
 ;; Prologue, epilogue and miscellaneous
 ;; -------------------------------------------------------------------
@@ -344,7 +388,15 @@
   [(return)]
   ""
 {
-  tdm_expand_epilogue ();
+  tdm_expand_epilogue (false);
+  DONE;
+})
+
+(define_expand "sibcall_epilogue"
+  [(return)]
+  ""
+{
+  tdm_expand_epilogue (true);
   DONE;
 })
 
