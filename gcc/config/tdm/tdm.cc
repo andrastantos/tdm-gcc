@@ -1165,7 +1165,10 @@ tdm_cbranch_prefix_length (rtx_insn *insn, int *nlits = NULL)
 
 /* ADJUST_INSN_LENGTH for INSN with length attribute LENGTH: add the
    cbranch prefix.  A jump or cbranch whose target is in a pool always
-   loads it from there, near or far, and is as long as a near one.  */
+   loads it from there, near or far, and is as long as a near one.  A
+   branch between the hot and the cold part of a function is far
+   otherwise: the distance between the sections is only known when
+   linking.  */
 
 int
 tdm_adjust_insn_length (rtx_insn *insn, int length)
@@ -1173,16 +1176,24 @@ tdm_adjust_insn_length (rtx_insn *insn, int length)
   if (!INSN_P (insn))
     return length;
   int code = recog_memoized (insn);
+  bool crossing = JUMP_P (insn) && CROSSING_JUMP_P (insn);
   if (code == CODE_FOR_tdm_cbranchhi4)
     {
       int nlits;
       int prefix = tdm_cbranch_prefix_length (insn, &nlits);
       if (tdm_literal_pooled_p (insn, nlits))
 	length = 4;
+      else if (crossing)
+	length = 8;
       length += prefix;
     }
-  else if (code == CODE_FOR_jump && tdm_literal_pooled_p (insn, 0))
-    length = 2;
+  else if (code == CODE_FOR_jump)
+    {
+      if (tdm_literal_pooled_p (insn, 0))
+	length = 2;
+      else if (crossing)
+	length = 4;
+    }
   return length;
 }
 
