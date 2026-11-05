@@ -2804,6 +2804,11 @@ tdm_init_libfuncs (void)
 #define TARGET_FUNCTION_ARG tdm_function_arg
 #undef  TARGET_FUNCTION_ARG_ADVANCE
 #define TARGET_FUNCTION_ARG_ADVANCE tdm_function_arg_advance
+/* The named arguments of a variadic function are passed as in any other
+   call, the first in $r0 if it fits; only the unnamed ones always go on
+   the stack.  So va_start has no register to save.  */
+#undef  TARGET_STRICT_ARGUMENT_NAMING
+#define TARGET_STRICT_ARGUMENT_NAMING hook_bool_CUMULATIVE_ARGS_true
 #undef  TARGET_FUNCTION_VALUE
 #define TARGET_FUNCTION_VALUE tdm_function_value
 #undef  TARGET_LIBCALL_VALUE
