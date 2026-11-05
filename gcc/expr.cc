@@ -4444,13 +4444,15 @@ emit_move_complex (machine_mode mode, rtx x, rtx y)
       rtx_insn *ret;
 
       /* For memory to memory moves, optimal behavior can be had with the
-	 existing block move logic.  But use normal expansion if optimizing
-	 for size.  */
+	 existing block move logic.  But allow a call to memcpy if
+	 optimizing for size, as long as its arguments go in registers:
+	 X may be an outgoing argument slot (emit_push_insn), which
+	 memcpy's own stack arguments would clobber.  */
       if (MEM_P (x) && MEM_P (y))
 	{
 	  emit_block_move (x, y, gen_int_mode (GET_MODE_SIZE (mode), Pmode),
 			   (optimize_insn_for_speed_p()
-			    ? BLOCK_OP_NO_LIBCALL : BLOCK_OP_NORMAL));
+			    ? BLOCK_OP_NO_LIBCALL : BLOCK_OP_CALL_PARM));
 	  return get_last_insn ();
 	}
 
