@@ -2742,6 +2742,17 @@ tdm_constant_alignment (const_tree, HOST_WIDE_INT align)
   return MAX (align, 16);
 }
 
+/* By default a vector is aligned to its size, which can be more than
+   the stack gives (STACK_BOUNDARY) and than GCC assumes of memory with
+   no alignment of its own (BIGGEST_ALIGNMENT).  There's no vector unit
+   to want more.  */
+
+static HOST_WIDE_INT
+tdm_vector_alignment (const_tree type)
+{
+  return MIN (default_vector_alignment (type), BIGGEST_ALIGNMENT);
+}
+
 /* Miscellaneous.  */
 
 static void
@@ -2830,6 +2841,8 @@ tdm_init_libfuncs (void)
 #define TARGET_ASM_UNALIGNED_DI_OP NULL
 #undef  TARGET_CONSTANT_ALIGNMENT
 #define TARGET_CONSTANT_ALIGNMENT tdm_constant_alignment
+#undef  TARGET_VECTOR_ALIGNMENT
+#define TARGET_VECTOR_ALIGNMENT tdm_vector_alignment
 
 #undef  TARGET_TRAMPOLINE_INIT
 #define TARGET_TRAMPOLINE_INIT tdm_trampoline_init
