@@ -5,3 +5,8 @@
 LIB2ADD += $(srcdir)/config/tdm/lib2-hi.c \
 	   $(srcdir)/config/tdm/lib2-si.c \
 	   $(srcdir)/config/tdm/lib2-trapv.c
+
+# Memory is small: optimize for size, and put each function in a section
+# of its own, so that the link (--gc-sections) keeps only those used.
+# This comes after libgcc's own -O2.
+HOST_LIBGCC2_CFLAGS += -Os -ffunction-sections -fdata-sections
