@@ -18,3 +18,5 @@
 
 MULTILIB_OPTIONS = muser-mode
 MULTILIB_DIRNAMES = user-mode
+
+PASSES_EXTRA += $(srcdir)/config/tdm/tdm-passes.def

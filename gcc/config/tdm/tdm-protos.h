@@ -41,3 +41,9 @@ extern const char *tdm_output_indirect_jump (rtx);
 extern const char *tdm_output_call (rtx);
 extern void tdm_output_skip (FILE *, unsigned HOST_WIDE_INT);
 extern void tdm_output_ascii (FILE *, const char *, int);
+
+#ifdef RTX_CODE
+class rtl_opt_pass;
+namespace gcc { class context; }
+extern rtl_opt_pass *make_pass_tdm_scratch (gcc::context *);
+#endif
