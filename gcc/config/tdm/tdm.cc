@@ -435,7 +435,13 @@ tdm_symbolic_text (rtx x, char *buf, size_t len)
      if $r1 is clobbered, and a "mov $r1, X" goes if the next
      instruction overwrites $r1.
 
-   Counting for the length does the same.  */
+   Counting for the length does the same.
+
+   Two insns next to each other that access memory through the same
+   byte pointer in $r0 join: the "rol $r0" that ends the first and the
+   "ror $r0" that starts the second go, and $r0 stays rotated in
+   between (see tdm_r0_join_p).  The length of each insn then counts one
+   less word.  */
 
 /* The insn whose output is in the buffer, and the buffer.  */
 static rtx_insn *tdm_buf_insn;
@@ -511,6 +517,161 @@ tdm_local_jump_p (const char *line)
 	     && p[5] == ']'))
       return true;
   return false;
+}
+
+static int tdm_count_insn (rtx_insn *, vec<tdm_lit> *);
+
+/* While tdm_r0_ends counts an insn: its result.  */
+static bool tdm_r0_querying;
+static int tdm_r0_query_head, tdm_r0_query_tail;
+
+/* The insn that the one output last joined (see above).  */
+static rtx_insn *tdm_r0_joined;
+
+/* The insn whose output comes right after that of INSN, if it is
+   buffered, and nothing else that runs is output in between: a pool
+   between them, with a jump over it, keeps them next to each other,
+   so that placing pools doesn't change the lengths of the insns around
+   them.  */
+
+static rtx_insn *
+tdm_r0_next (rtx_insn *insn)
+{
+  for (rtx_insn *i = NEXT_INSN (insn); i; i = NEXT_INSN (i))
+    {
+      if (NOTE_P (i))
+	{
+	  if (NOTE_KIND (i) == NOTE_INSN_DELETED_LABEL
+	      || NOTE_KIND (i) == NOTE_INSN_DELETED_DEBUG_LABEL
+	      || NOTE_KIND (i) == NOTE_INSN_SWITCH_TEXT_SECTIONS)
+	    return NULL;
+	  continue;
+	}
+      if (DEBUG_INSN_P (i))
+	continue;
+      if (NONJUMP_INSN_P (i)
+	  && (GET_CODE (PATTERN (i)) == USE
+	      || GET_CODE (PATTERN (i)) == CLOBBER
+	      || recog_memoized (i) == CODE_FOR_tdm_pool))
+	continue;
+      return tdm_buffered_insn_p (i) ? i : NULL;
+    }
+  return NULL;
+}
+
+/* The same for the insn whose output comes right before.  */
+
+static rtx_insn *
+tdm_r0_prev (rtx_insn *insn)
+{
+  for (rtx_insn *i = PREV_INSN (insn); i; i = PREV_INSN (i))
+    {
+      if (NOTE_P (i))
+	{
+	  if (NOTE_KIND (i) == NOTE_INSN_DELETED_LABEL
+	      || NOTE_KIND (i) == NOTE_INSN_DELETED_DEBUG_LABEL
+	      || NOTE_KIND (i) == NOTE_INSN_SWITCH_TEXT_SECTIONS)
+	    return NULL;
+	  continue;
+	}
+      if (DEBUG_INSN_P (i))
+	continue;
+      if (NONJUMP_INSN_P (i)
+	  && (GET_CODE (PATTERN (i)) == USE
+	      || GET_CODE (PATTERN (i)) == CLOBBER
+	      || recog_memoized (i) == CODE_FOR_tdm_pool))
+	continue;
+      return tdm_buffered_insn_p (i) ? i : NULL;
+    }
+  return NULL;
+}
+
+/* Count INSN, and return whether its output, after the peephole, starts
+   with a "ror $r0" (HEAD) and ends with a "rol $r0" (TAIL) that a join
+   may drop.  */
+
+static void
+tdm_r0_ends (rtx_insn *insn, bool *head, bool *tail)
+{
+  bool counting = tdm_counting;
+  int words = tdm_words;
+  vec<tdm_lit> *lits = tdm_lits;
+  rtx_insn *lit_insn = tdm_lit_insn;
+  int lit_index = tdm_lit_index;
+
+  gcc_checking_assert (!tdm_r0_querying);
+  tdm_r0_querying = true;
+  tdm_r0_query_head = tdm_r0_query_tail = -1;
+  tdm_count_insn (insn, NULL);
+  tdm_r0_querying = false;
+  *head = tdm_r0_query_head >= 0;
+  *tail = tdm_r0_query_tail >= 0;
+
+  tdm_counting = counting;
+  tdm_words = words;
+  tdm_lits = lits;
+  tdm_lit_insn = lit_insn;
+  tdm_lit_index = lit_index;
+  /* The operands of INSN are in recog_data now.  */
+  recog_data.insn = NULL;
+}
+
+/* Whether A and B, whose output follows that of A, join.  A source
+   line starts with B otherwise: a debugger stopping there would find
+   $r0 rotated.  */
+
+static bool
+tdm_r0_join_p (rtx_insn *a, rtx_insn *b)
+{
+  location_t la = INSN_LOCATION (a), lb = INSN_LOCATION (b);
+  if (lb == UNKNOWN_LOCATION)
+    return true;
+  if (la == UNKNOWN_LOCATION)
+    return false;
+  expanded_location ea = expand_location (la), eb = expand_location (lb);
+  return (ea.line == eb.line
+	  && (ea.file == eb.file
+	      || (ea.file && eb.file && strcmp (ea.file, eb.file) == 0)));
+}
+
+/* Set *HEAD and *TAIL to the first and the last of the lines in the
+   buffer that stay and mention $r0, if they are a "ror $r0" and a
+   "rol $r0" that a join may drop, or to -1.  */
+
+static void
+tdm_r0_buf_ends (const vec<bool> &keep, int *head, int *tail)
+{
+  unsigned int n = tdm_buf.length ();
+  int first = -1, last = -1;
+
+  *head = *tail = -1;
+  for (unsigned int i = 0; i < n; i++)
+    if (tdm_local_jump_p (tdm_buf[i]))
+      return;
+  for (unsigned int i = 0; i < n; i++)
+    if (keep[i] && tdm_mentions_p (tdm_buf[i], "$r0"))
+      {
+	if (first < 0)
+	  first = i;
+	last = i;
+      }
+  if (first < 0)
+    return;
+
+  /* Whether the line I is conditional: the line that stays before it is
+     a predicate.  */
+  auto conditional = [&] (int i)
+    {
+      for (int j = i - 1; j >= 0; j--)
+	if (keep[j])
+	  return startswith (tdm_buf[j], "if_");
+      return false;
+    };
+  if (strcmp (tdm_buf[first], "ror\t$r0") == 0 && !conditional (first))
+    *head = first;
+  if (last != first
+      && strcmp (tdm_buf[last], "rol\t$r0") == 0 && !conditional (last))
+    *tail = last;
 }
 
 /* Set KEEP[I] for the lines in the buffer that stay (see above).  */
@@ -651,6 +812,53 @@ tdm_buf_finish (void)
   int w = 0;
 
   tdm_scratch_peephole (keep);
+
+  int head, tail;
+  tdm_r0_buf_ends (keep, &head, &tail);
+  if (tdm_r0_querying)
+    {
+      tdm_r0_query_head = head;
+      tdm_r0_query_tail = tail;
+    }
+  else
+    {
+      rtx_insn *insn = tdm_buf_insn;
+      bool head_ok, tail_ok;
+
+      /* The insn before INSN has joined it.  */
+      bool joined;
+      if (tdm_counting)
+	{
+	  rtx_insn *prev = head >= 0 ? tdm_r0_prev (insn) : NULL;
+	  joined = false;
+	  if (prev && tdm_r0_join_p (prev, insn))
+	    {
+	      tdm_r0_ends (prev, &head_ok, &tail_ok);
+	      joined = tail_ok;
+	    }
+	}
+      else
+	{
+	  joined = tdm_r0_joined == insn;
+	  gcc_checking_assert (!joined || head >= 0);
+	}
+      if (joined)
+	keep[head] = false;
+
+      /* INSN joins the next one.  */
+      rtx_insn *next = tail >= 0 ? tdm_r0_next (insn) : NULL;
+      bool joins = false;
+      if (next && tdm_r0_join_p (insn, next))
+	{
+	  tdm_r0_ends (next, &head_ok, &tail_ok);
+	  joins = head_ok;
+	}
+      if (joins)
+	keep[tail] = false;
+      if (!tdm_counting)
+	tdm_r0_joined = joins ? next : NULL;
+    }
+
   for (unsigned int i = 0; i < n; i++)
     {
       word.quick_push (w);
