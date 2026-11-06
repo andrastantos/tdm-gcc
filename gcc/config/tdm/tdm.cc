@@ -49,6 +49,8 @@
 #include "builtins.h"
 #include "dumpfile.h"
 #include "insn-addr.h"
+#include "tree-pass.h"
+#include "rtl-iter.h"
 
 /* This file should be included last.  */
 #include "target-def.h"
@@ -414,6 +416,270 @@ tdm_symbolic_text (rtx x, char *buf, size_t len)
     snprintf (buf, len, "%%bptr(%s)", name);
 }
 
+/* Scratch registers.
+
+   The output of an insn often needs $r1 as a scratch register, and
+   restores it afterwards; and an access through a byte pointer in $r0
+   rotates it right and back.  tdm_mark_scratch emits a clobber of $r1
+   (or $r0) after an insn where it is dead, so that the output can leave
+   it changed, and variable tracking, which comes later, knows that its
+   value is gone.
+
+   The output of an insn other than a jump, a call or a pool goes to a
+   buffer, and tdm_scratch_peephole drops what isn't needed:
+
+   - "rol $r0; ror $r0" (or the other way round), which changes nothing;
+   - the final "rol $r0", if $r0 is clobbered;
+   - a save of $r1 in [$sp-1] and its restore, if $r1 is clobbered;
+   - "swap $r1, X ... swap $r1, X" becomes "mov $r1, X ... mov X, $r1"
+     if $r1 is clobbered, and a "mov $r1, X" goes if the next
+     instruction overwrites $r1.
+
+   Counting for the length does the same.  */
+
+/* The insn whose output is in the buffer, and the buffer.  */
+static rtx_insn *tdm_buf_insn;
+static auto_vec<char *> tdm_buf;
+
+/* Whether $r0 and $r1 are clobbered after the insn in the buffer.  */
+static bool tdm_buf_r0_free, tdm_buf_r1_free;
+
+/* Whether the output of INSN goes to the buffer.  */
+
+static bool
+tdm_buffered_insn_p (rtx_insn *insn)
+{
+  return (insn
+	  && NONJUMP_INSN_P (insn)
+	  && recog_memoized (insn) >= 0
+	  && recog_memoized (insn) != CODE_FOR_tdm_pool);
+}
+
+/* Whether a clobber of hard register REGNO follows INSN.  */
+
+static bool
+tdm_clobbered_after_p (rtx_insn *insn, unsigned int regno)
+{
+  for (rtx_insn *i = NEXT_INSN (insn); i; i = NEXT_INSN (i))
+    {
+      if (NOTE_P (i) || DEBUG_INSN_P (i))
+	continue;
+      if (!NONJUMP_INSN_P (i) || GET_CODE (PATTERN (i)) != CLOBBER)
+	return false;
+      rtx x = XEXP (PATTERN (i), 0);
+      if (REG_P (x) && REGNO (x) == regno)
+	return true;
+    }
+  return false;
+}
+
+/* Start buffering the output of INSN.  */
+
+static void
+tdm_buf_start (rtx_insn *insn)
+{
+  gcc_checking_assert (tdm_buf.is_empty ());
+  tdm_buf_insn = insn;
+  tdm_buf_r0_free = tdm_clobbered_after_p (insn, R0_REGNUM);
+  tdm_buf_r1_free = tdm_clobbered_after_p (insn, R1_REGNUM);
+}
+
+/* Whether LINE mentions X: X not followed by a digit, so that $mr1
+   isn't found in $mr19.  */
+
+static bool
+tdm_mentions_p (const char *line, const char *x)
+{
+  size_t n = strlen (x);
+  for (const char *p = strstr (line, x); p; p = strstr (p + 1, x))
+    if (!ISDIGIT (p[n]))
+      return true;
+  return false;
+}
+
+/* Whether LINE jumps by a number of words, within the output of the
+   insn, other than over its own literal.  Lines can't be dropped then.  */
+
+static bool
+tdm_local_jump_p (const char *line)
+{
+  if (strcmp (line, "mov\t$pc, $pc+2") == 0)
+    return false;
+  for (const char *p = strstr (line, "$pc+"); p; p = strstr (p + 1, "$pc+"))
+    if (ISDIGIT (p[4])
+	&& !(p > line && p[-1] == '[' && (p[4] == '1' || p[4] == '2')
+	     && p[5] == ']'))
+      return true;
+  return false;
+}
+
+/* Set KEEP[I] for the lines in the buffer that stay (see above).  */
+
+static void
+tdm_scratch_peephole (vec<bool> &keep)
+{
+  unsigned int n = tdm_buf.length ();
+  bool jumps = false;
+
+  for (unsigned int i = 0; i < n; i++)
+    {
+      keep.quick_push (true);
+      jumps |= tdm_local_jump_p (tdm_buf[i]);
+    }
+  if (jumps)
+    return;
+
+  auto_vec<int> l;
+  bool changed = true;
+  while (changed)
+    {
+      changed = false;
+      /* The lines that stay.  */
+      l.truncate (0);
+      for (unsigned int i = 0; i < n; i++)
+	if (keep[i])
+	  l.safe_push (i);
+      int m = l.length ();
+#define LINE(I) (tdm_buf[l[I]])
+      /* A line that a predicate makes conditional stays as it is.  */
+#define CONDITIONAL(I) ((I) > 0 && startswith (LINE ((I) - 1), "if_"))
+#define DROP(I) (keep[l[I]] = false, changed = true)
+
+      for (int i = 0; i + 1 < m && !changed; i++)
+	if (((strcmp (LINE (i), "rol\t$r0") == 0
+	      && strcmp (LINE (i + 1), "ror\t$r0") == 0)
+	     || (strcmp (LINE (i), "ror\t$r0") == 0
+		 && strcmp (LINE (i + 1), "rol\t$r0") == 0))
+	    && !CONDITIONAL (i))
+	  {
+	    DROP (i);
+	    DROP (i + 1);
+	  }
+      if (changed)
+	continue;
+
+      if (tdm_buf_r0_free)
+	for (int i = m - 1; i >= 0; i--)
+	  if (tdm_mentions_p (LINE (i), "$r0"))
+	    {
+	      if (strcmp (LINE (i), "rol\t$r0") == 0 && !CONDITIONAL (i))
+		DROP (i);
+	      break;
+	    }
+      if (changed || !tdm_buf_r1_free)
+	continue;
+
+      /* The last line that mentions $r1, and whether a later one
+	 mentions the scratch word.  */
+      int last = -1;
+      bool scratch_after = false;
+      for (int i = 0; i < m; i++)
+	if (tdm_mentions_p (LINE (i), "$r1"))
+	  last = i, scratch_after = false;
+	else if (tdm_mentions_p (LINE (i), "[$sp-1]"))
+	  scratch_after = true;
+
+      for (int i = 0; i < last && !changed; i++)
+	{
+	  const char *a = LINE (i);
+	  int j;
+
+	  if (CONDITIONAL (i))
+	    continue;
+
+	  /* A save of $r1 and the restore that is its last mention.  */
+	  if (strcmp (a, "mov\t[$sp-1], $r1") == 0)
+	    {
+	      if (strcmp (LINE (last), "mov\t$r1, [$sp-1]") != 0
+		  || CONDITIONAL (last) || scratch_after)
+		continue;
+	      for (j = i + 1; j < last; j++)
+		if (tdm_mentions_p (LINE (j), "[$sp-1]"))
+		  break;
+	      if (j == last)
+		{
+		  DROP (i);
+		  DROP (last);
+		}
+	    }
+
+	  /* A swap with X and the one back that is the last mention.  */
+	  else if (startswith (a, "swap\t$r1, ") && strcmp (a, LINE (last)) == 0)
+	    {
+	      const char *x = a + strlen ("swap\t$r1, ");
+	      for (j = i + 1; j < last; j++)
+		if (tdm_mentions_p (LINE (j), x))
+		  break;
+	      if (j == last)
+		{
+		  char *back = xasprintf ("mov\t%s, $r1", x);
+		  char *load = xasprintf ("mov\t$r1, %s", x);
+		  free (LINE (last));
+		  LINE (last) = back;
+		  free (LINE (i));
+		  LINE (i) = load;
+		  changed = true;
+		}
+	    }
+
+	  /* A load of $r1 that the next line overwrites.  */
+	  else if (startswith (a, "mov\t$r1, ")
+		   && startswith (LINE (i + 1), "mov\t$r1, ")
+		   && !tdm_mentions_p (LINE (i + 1) + strlen ("mov\t$r1, "),
+				       "$r1"))
+	    DROP (i);
+	}
+#undef LINE
+#undef CONDITIONAL
+#undef DROP
+    }
+}
+
+/* Finish the output of the insn in the buffer: drop what isn't needed,
+   count it, give the literals in tdm_lits their final words, and unless
+   counting, output it.  */
+
+static void
+tdm_buf_finish (void)
+{
+  if (!tdm_buf_insn)
+    return;
+
+  unsigned int n = tdm_buf.length ();
+  auto_vec<bool> keep (n);
+  auto_vec<int> word (n + 1);
+  int w = 0;
+
+  tdm_scratch_peephole (keep);
+  for (unsigned int i = 0; i < n; i++)
+    {
+      word.quick_push (w);
+      w += keep[i];
+    }
+  word.quick_push (w);
+  if (tdm_lits)
+    for (tdm_lit &l : *tdm_lits)
+      l.word = word[l.word];
+  tdm_words = w;
+
+  for (unsigned int i = 0; i < n; i++)
+    {
+      if (keep[i] && !tdm_counting)
+	fprintf (asm_out_file, "\t%s\n", tdm_buf[i]);
+      free (tdm_buf[i]);
+    }
+  tdm_buf.truncate (0);
+  tdm_buf_insn = NULL;
+}
+
+/* TARGET_ASM_FINAL_POSTSCAN_INSN: the output of an insn is complete.  */
+
+static void
+tdm_final_postscan_insn (FILE *, rtx_insn *, rtx *, int)
+{
+  tdm_buf_finish ();
+}
+
 /* Emit one instruction or data word.  When only counting (for the
    length attribute), count it.  */
 
@@ -422,13 +688,32 @@ tdm_emit (const char *fmt, ...)
 {
   va_list ap;
 
-  tdm_words++;
-  if (tdm_counting)
-    return;
+  if (!tdm_counting && current_output_insn != tdm_buf_insn)
+    {
+      tdm_buf_finish ();
+      if (tdm_buffered_insn_p (current_output_insn))
+	tdm_buf_start (current_output_insn);
+    }
   va_start (ap, fmt);
-  putc ('\t', asm_out_file);
-  vfprintf (asm_out_file, fmt, ap);
-  putc ('\n', asm_out_file);
+  if (tdm_buf_insn)
+    {
+      /* Until tdm_buf_finish, the word of a literal in tdm_lits is its
+	 index in the buffer.  */
+      gcc_checking_assert (!tdm_counting
+			   || tdm_words == (int) tdm_buf.length ());
+      tdm_buf.safe_push (xvasprintf (fmt, ap));
+      tdm_words++;
+    }
+  else
+    {
+      tdm_words++;
+      if (!tdm_counting)
+	{
+	  putc ('\t', asm_out_file);
+	  vfprintf (asm_out_file, fmt, ap);
+	  putc ('\n', asm_out_file);
+	}
+    }
   va_end (ap);
 }
 
@@ -1126,6 +1411,34 @@ tdm_cbranch_operand (rtx *operands)
   return b;
 }
 
+/* While counting the length of an insn, the buffered output of another
+   one being output is put aside.  */
+
+class tdm_buf_stash
+{
+public:
+  tdm_buf_stash ()
+    : m_insn (tdm_buf_insn), m_r0 (tdm_buf_r0_free), m_r1 (tdm_buf_r1_free)
+  {
+    m_buf.safe_splice (tdm_buf);
+    tdm_buf.truncate (0);
+    tdm_buf_insn = NULL;
+  }
+  ~tdm_buf_stash ()
+  {
+    gcc_checking_assert (!tdm_buf_insn && tdm_buf.is_empty ());
+    tdm_buf.safe_splice (m_buf);
+    tdm_buf_insn = m_insn;
+    tdm_buf_r0_free = m_r0;
+    tdm_buf_r1_free = m_r1;
+  }
+
+private:
+  rtx_insn *m_insn;
+  bool m_r0, m_r1;
+  auto_vec<char *> m_buf;
+};
+
 /* The length in octets of what tdm_cbranch_operand emits for INSN.
    Set *NLITS, if given, to the number of literals in it.  */
 
@@ -1143,6 +1456,7 @@ tdm_cbranch_prefix_length (rtx_insn *insn, int *nlits = NULL)
     *nlits = 0;
   if (!reload_completed)
     return 2;
+  tdm_buf_stash stash;
   extract_constrain_insn_cached (insn);
   tdm_counting = true;
   tdm_words = 0;
@@ -1275,13 +1589,17 @@ tdm_count_insn (rtx_insn *insn, vec<tdm_lit> *lits)
   if (code < 0 || !reload_completed)
     return 2;
 
+  tdm_buf_stash stash;
   extract_constrain_insn_cached (insn);
   tdm_counting = true;
   tdm_words = 0;
   tdm_lits = lits;
   tdm_lit_insn = insn;
   tdm_lit_index = 0;
+  if (tdm_buffered_insn_p (insn))
+    tdm_buf_start (insn);
   tmpl = get_insn_template (code, insn);
+  tdm_buf_finish ();
   tdm_lit_insn = NULL;
   tdm_lits = NULL;
   tdm_counting = false;
@@ -1542,6 +1860,95 @@ tdm_pool_reach (const tdm_pool_use &u, int flat, const tdm_pool &p)
     if (!tdm_pool_entries[e].dead)
       to++;
   return IN_RANGE (to - from, -32, 31) ? 0 : to - from;
+}
+
+/* Whether INSN accesses memory through $r0.  */
+
+static bool
+tdm_r0_base_p (rtx_insn *insn)
+{
+  subrtx_iterator::array_type array;
+  FOR_EACH_SUBRTX (iter, array, PATTERN (insn), NONCONST)
+    if (MEM_P (*iter) && reg_mentioned_p (gen_rtx_REG (Pmode, R0_REGNUM),
+					   XEXP (*iter, 0)))
+      return true;
+  return false;
+}
+
+/* Emit a clobber of $r1 after each insn where it is dead and that
+   doesn't use it, and of $r0 after each insn where it is dead and that
+   accesses memory through it (see "Scratch registers").  Not after
+   jumps and calls, whose output doesn't make use of it.  */
+
+static unsigned int
+tdm_mark_scratch (void)
+{
+  rtx r0 = gen_rtx_REG (HImode, R0_REGNUM);
+  rtx r1 = gen_rtx_REG (HImode, R1_REGNUM);
+  auto_bitmap live;
+  basic_block bb;
+
+  df_analyze ();
+  FOR_EACH_BB_FN (bb, cfun)
+    {
+      rtx_insn *insn, *prev;
+
+      bitmap_copy (live, df_get_live_out (bb));
+      df_simulate_initialize_backwards (bb, live);
+      FOR_BB_INSNS_REVERSE_SAFE (bb, insn, prev)
+	{
+	  if (!NONDEBUG_INSN_P (insn))
+	    continue;
+	  if (NONJUMP_INSN_P (insn) && recog_memoized (insn) >= 0)
+	    {
+	      if (!bitmap_bit_p (live, R1_REGNUM)
+		  && !reg_mentioned_p (r1, PATTERN (insn)))
+		emit_insn_after (gen_rtx_CLOBBER (VOIDmode, r1), insn);
+	      if (!bitmap_bit_p (live, R0_REGNUM)
+		  && !reg_set_p (r0, insn)
+		  && tdm_r0_base_p (insn))
+		emit_insn_after (gen_rtx_CLOBBER (VOIDmode, r0), insn);
+	    }
+	  df_simulate_one_insn_backwards (bb, insn, live);
+	}
+    }
+  return 0;
+}
+
+namespace {
+
+const pass_data pass_data_tdm_scratch =
+{
+  RTL_PASS, /* type */
+  "tdm_scratch", /* name */
+  OPTGROUP_NONE, /* optinfo_flags */
+  TV_MACH_DEP, /* tv_id */
+  0, /* properties_required */
+  0, /* properties_provided */
+  0, /* properties_destroyed */
+  0, /* todo_flags_start */
+  0, /* todo_flags_finish */
+};
+
+class pass_tdm_scratch : public rtl_opt_pass
+{
+public:
+  pass_tdm_scratch (gcc::context *ctxt)
+    : rtl_opt_pass (pass_data_tdm_scratch, ctxt)
+  {}
+
+  unsigned int execute (function *) final override
+  {
+    return tdm_mark_scratch ();
+  }
+};
+
+} // anon namespace
+
+rtl_opt_pass *
+make_pass_tdm_scratch (gcc::context *ctxt)
+{
+  return new pass_tdm_scratch (ctxt);
 }
 
 /* Machine-dependent reorg: put the wide operands of the function in
@@ -2793,6 +3200,8 @@ tdm_init_libfuncs (void)
 #define TARGET_FRAME_POINTER_REQUIRED tdm_frame_pointer_required
 #undef  TARGET_MACHINE_DEPENDENT_REORG
 #define TARGET_MACHINE_DEPENDENT_REORG tdm_reorg
+#undef  TARGET_ASM_FINAL_POSTSCAN_INSN
+#define TARGET_ASM_FINAL_POSTSCAN_INSN tdm_final_postscan_insn
 #undef  TARGET_MD_ASM_ADJUST
 #define TARGET_MD_ASM_ADJUST tdm_md_asm_adjust
 #undef  TARGET_CANNOT_SUBSTITUTE_MEM_EQUIV_P
