@@ -2109,6 +2109,28 @@ tdm_reorg (void)
 	  shift += pools[id].skip + pools[id].size;
 	  pending.truncate (0);
 	  forced = id;
+
+	  /* The uses before it of the pools after barriers further on are
+	     further from them now: move those that get out of reach to
+	     it.  */
+	  for (unsigned int i = 0; i < ui; i++)
+	    {
+	      tdm_pool_use &u = uses[i];
+	      if (u.ent < 0 || u.seg != seg)
+		continue;
+	      const tdm_pool_ent &x = b.m_ents[u.ent];
+	      const tdm_pool &q = pools[x.pool];
+	      if (q.passed || x.pool == id || q.seg != seg
+		  || pools[id].size >= TDM_POOL_MAX
+		  || (tdm_insn_word (q.insn) + shift + q.skip + x.pos - u.addr
+		      <= 31 - TDM_POOL_MARGIN))
+		continue;
+	      b.m_ents[u.ent].nuses--;
+	      tdm_lit_labels->remove (std::make_pair (INSN_UID (u.insn),
+						      u.index));
+	      b.new_entry (&u, id);
+	      shift++;
+	    }
 	};
 
       for (rtx_insn *insn = get_insns (); insn; insn = NEXT_INSN (insn))
@@ -2153,13 +2175,18 @@ tdm_reorg (void)
 	  for (; ui < uses.length () && uses[ui].insn == insn; ui++)
 	    {
 	      tdm_pool_use &u = uses[ui];
-	      if (u.ent >= 0)
-		continue;
 	      if (!counted)
 		{
 		  lits.truncate (0);
 		  tdm_count_insn (insn, &lits);
 		  counted = true;
+		}
+	      if (u.ent >= 0)
+		{
+		  /* In a pool after a barrier: see flush.  */
+		  if (u.index < (int) lits.length ())
+		    u.addr = tdm_insn_word (insn) + shift + lits[u.index].word;
+		  continue;
 		}
 	      /* A branch that the pools above brought in reach of its
 		 target has no literal any more.  */
@@ -2224,7 +2251,8 @@ tdm_reorg (void)
       tdm_pool_entry &e = tdm_pool_entries[tdm_pool_start[x.pool] + x.pos];
       snprintf (e.text, sizeof e.text, "%s", x.text);
       e.label = x.label;
-      e.dead = false;
+      /* An entry whose uses moved to another pool.  */
+      e.dead = x.nuses == 0;
     }
 
   /* Check the distances with the pools in place, and put the uses out
