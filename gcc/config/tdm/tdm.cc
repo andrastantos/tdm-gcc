@@ -237,6 +237,67 @@ tdm_r0_even_p (rtx x, HOST_WIDE_INT off)
   return ((parity ^ off) & 1) == 0;
 }
 
+/* Whether the function may access an octet through $r0 whose half of
+   the word isn't known, which calls a byte access helper (see
+   tdm_emit_byte_helper_call).  Such a function needs a frame, whose free
+   word at [$sp] takes the return address.  The frame can't change once
+   register allocation starts, so the answer is kept from then on; it
+   comes from the octets in memory not addressed through $sp, the frame
+   or a constant, whose bases go into $r0.  If the output still finds such
+   an access in a function without a frame, it does it inline.  */
+
+static bool
+tdm_may_call_byte_helper (void)
+{
+  static int funcdef_no = -1;
+  static bool result;
+  bool keep = reload_completed || reload_in_progress || lra_in_progress;
+
+  if (keep && funcdef_no == cfun->funcdef_no)
+    return result;
+
+  bool found = false;
+  for (rtx_insn *insn = get_insns (); insn && !found; insn = NEXT_INSN (insn))
+    {
+      if (!NONDEBUG_INSN_P (insn))
+	continue;
+      subrtx_var_iterator::array_type array;
+      FOR_EACH_SUBRTX_VAR (iter, array, PATTERN (insn), NONCONST)
+	{
+	  rtx x = *iter;
+	  if (!MEM_P (x) || GET_MODE (x) != QImode)
+	    continue;
+	  rtx addr = XEXP (x, 0);
+	  HOST_WIDE_INT off = 0;
+	  if (GET_CODE (addr) == PLUS && CONST_INT_P (XEXP (addr, 1)))
+	    {
+	      off = INTVAL (XEXP (addr, 1));
+	      addr = XEXP (addr, 0);
+	    }
+	  if (CONSTANT_P (addr))
+	    continue;
+	  if (REG_P (addr)
+	      && (REGNO (addr) == STACK_POINTER_REGNUM
+		  || REGNO (addr) == ARG_POINTER_REGNUM
+		  || REGNO (addr) == FRAME_POINTER_REGNUM
+		  || REGNO (addr) == HARD_FRAME_POINTER_REGNUM
+		  || VIRTUAL_REGISTER_NUM_P (REGNO (addr))))
+	    continue;
+	  if (!tdm_r0_even_p (x, off))
+	    {
+	      found = true;
+	      break;
+	    }
+	}
+    }
+  if (keep)
+    {
+      funcdef_no = cfun->funcdef_no;
+      result = found;
+    }
+  return found;
+}
+
 /* Describe operand X.  */
 
 static tdm_loc
@@ -953,17 +1014,36 @@ tdm_final_postscan_insn (FILE *, rtx_insn *, rtx *, int)
 /* Emit one instruction or data word.  When only counting (for the
    length attribute), count it.  */
 
-static void ATTRIBUTE_PRINTF_1
-tdm_emit (const char *fmt, ...)
-{
-  va_list ap;
+/* In final, start buffering the output of the insn being output if that
+   hasn't happened yet (counting starts it in tdm_count_insn).  */
 
+static void
+tdm_buf_sync (void)
+{
   if (!tdm_counting && current_output_insn != tdm_buf_insn)
     {
       tdm_buf_finish ();
       if (tdm_buffered_insn_p (current_output_insn))
 	tdm_buf_start (current_output_insn);
     }
+}
+
+/* Whether $r1 is dead after the insn being counted or output, so that
+   its output may leave it changed.  */
+
+static bool
+tdm_r1_free_p (void)
+{
+  tdm_buf_sync ();
+  return tdm_buf_insn != NULL && tdm_buf_r1_free;
+}
+
+static void ATTRIBUTE_PRINTF_1
+tdm_emit (const char *fmt, ...)
+{
+  va_list ap;
+
+  tdm_buf_sync ();
   va_start (ap, fmt);
   if (tdm_buf_insn)
     {
@@ -1272,11 +1352,33 @@ tdm_emit_rotate (const char *op, const tdm_loc &d)
 }
 
 /* Octet access through a byte pointer in $r0, whose half is only
-   known at run time.  C data lives in the first 32K words, so after
-   "ror $r0" bit 15 holds the half and the rest the word address.  The
-   high half path clears bit 15 with $mr5 (0x7fff) and puts $r0 back
-   with "rol; add 1", the low half path with "rol".  The jumps skip
-   fixed instruction counts.  OFF is the byte offset of the access.  */
+   known at run time.  The work is done out of line, in libgcc
+   (config/tdm/tdm-byte.S), with a convention of its own:
+
+   - __tdm_load8 loads the octet at the byte address in $r0, zero
+     extended, into $r1;
+   - __tdm_store8 stores the low octet of [$sp-1] at the byte address
+     in $r0, and changes $r1;
+
+   and nothing else changes, but the return address in [$sp].  They are
+   called as other functions are, with the address loaded into $r1.
+   OFF is the byte offset of the access, added to $r0 around the call.  */
+
+static bool tdm_frame_free_word_p (void);
+
+/* Call the byte access helper NAME.  */
+
+static void
+tdm_emit_byte_helper_call (const char *name)
+{
+  tdm_loc sym = tdm_make_loc (LOC_SYM);
+
+  sym.sym = gen_rtx_SYMBOL_REF (Pmode, name);
+  SYMBOL_REF_FLAGS (sym.sym) |= SYMBOL_FLAG_FUNCTION;
+  tdm_emit_to_reg ("mov", tdm_r1, sym);
+  tdm_emit ("mov\t[$sp], $r1");
+  tdm_emit ("swap\t$pc, [$sp]");
+}
 
 /* Load the octet at [$r0 + OFF], zero extended, into register D.  */
 
@@ -1290,21 +1392,28 @@ tdm_emit_load_octet_dynamic (const tdm_loc &d, HOST_WIDE_INT off)
     tdm_emit ("mov\t[$sp-1], $r1");
   if (off)
     tdm_emit_to_reg ("add", r0, tdm_make_loc (LOC_IMM, tdm_sext16 (off)));
-  tdm_emit ("ror\t$r0");
-  tdm_emit ("if_ges\t$r0, 0");
-  tdm_emit ("mov\t$pc, $pc+14");
-  /* High half.  */
-  tdm_emit ("and\t$r0, $mr5");
-  tdm_emit ("mov\t$r1, [$r0]");
-  for (int i = 0; i < 8; i++)
-    tdm_emit ("ror\t$r1");
-  tdm_emit ("rol\t$r0");
-  tdm_emit ("add\t$r0, 1");
-  tdm_emit ("mov\t$pc, $pc+3");
-  /* Low half.  */
-  tdm_emit ("mov\t$r1, [$r0]");
-  tdm_emit ("rol\t$r0");
-  tdm_emit ("and\t$r1, $mr3");
+  if (tdm_frame_free_word_p ())
+    tdm_emit_byte_helper_call ("__tdm_load8");
+  else
+    {
+      /* No frame: [$sp] holds the return address.  Inline, as
+	 __tdm_load8 does.  */
+      tdm_emit ("ror\t$r0");
+      tdm_emit ("if_ges\t$r0, 0");
+      tdm_emit ("mov\t$pc, $pc+14");
+      /* High half.  */
+      tdm_emit ("and\t$r0, $mr5");
+      tdm_emit ("mov\t$r1, [$r0]");
+      for (int i = 0; i < 8; i++)
+	tdm_emit ("ror\t$r1");
+      tdm_emit ("rol\t$r0");
+      tdm_emit ("add\t$r0, 1");
+      tdm_emit ("mov\t$pc, $pc+3");
+      /* Low half.  */
+      tdm_emit ("mov\t$r1, [$r0]");
+      tdm_emit ("rol\t$r0");
+      tdm_emit ("and\t$r1, $mr3");
+    }
 
   switch (d.kind)
     {
@@ -1323,13 +1432,31 @@ tdm_emit_load_octet_dynamic (const tdm_loc &d, HOST_WIDE_INT off)
     tdm_emit_to_reg ("add", r0, tdm_make_loc (LOC_IMM, tdm_sext16 (-off)));
 }
 
-/* Store the low octet of S at [$r0 + OFF]:
-   mem ^= (value ^ mem) & mask, in $r1.  */
+/* Store the low octet of S at [$r0 + OFF].  The value goes to the helper
+   in [$sp-1], by way of $r1.  If $r1 is live and S isn't $r1, or the
+   function has no frame, do it inline: mem ^= (value ^ mem) & mask, in
+   $r1.  */
 
 static void
 tdm_emit_store_octet_dynamic (const tdm_loc &s, HOST_WIDE_INT off)
 {
   tdm_loc r0 = tdm_make_loc (LOC_R0);
+  bool r1_free = tdm_r1_free_p ();
+
+  if ((s.kind == LOC_R1 || r1_free) && tdm_frame_free_word_p ())
+    {
+      tdm_emit_to_reg ("mov", tdm_r1, s);
+      tdm_emit ("mov\t[$sp-1], $r1");
+      if (off)
+	tdm_emit_to_reg ("add", r0, tdm_make_loc (LOC_IMM, tdm_sext16 (off)));
+      tdm_emit_byte_helper_call ("__tdm_store8");
+      if (off)
+	tdm_emit_to_reg ("add", r0, tdm_make_loc (LOC_IMM, tdm_sext16 (-off)));
+      /* The helper leaves the value, which was $r1, in [$sp-1].  */
+      if (!r1_free)
+	tdm_emit ("mov\t$r1, [$sp-1]");
+      return;
+    }
 
   tdm_emit ("mov\t[$sp-1], $r1");
   tdm_emit_to_reg ("mov", tdm_r1, s);
@@ -1338,7 +1465,9 @@ tdm_emit_store_octet_dynamic (const tdm_loc &s, HOST_WIDE_INT off)
   tdm_emit ("ror\t$r0");
   tdm_emit ("if_ges\t$r0, 0");
   tdm_emit ("mov\t$pc, $pc+16");
-  /* High half.  */
+  /* High half: C data lives in the first 32K words, so after "ror $r0"
+     bit 15 holds the half and the rest the word address; $mr5 (0x7fff)
+     clears bit 15.  */
   tdm_emit ("and\t$r0, $mr5");
   for (int i = 0; i < 8; i++)
     tdm_emit ("rol\t$r1");
@@ -2962,7 +3091,8 @@ tdm_fix_operand_pairs (rtx *operands, int n)
 
 /* Frame layout, from $sp up: a free word, the outgoing arguments, the
    saved registers and the local variables.  A leaf function without
-   any of these has no frame.  */
+   any of these, that calls no byte access helper either, has no frame:
+   its return address is at [$sp].  */
 
 struct tdm_frame_info
 {
@@ -2990,10 +3120,23 @@ tdm_compute_frame (tdm_frame_info *f)
   for (unsigned int regno = MR0_REGNUM; regno <= MR31_REGNUM; regno++)
     if (tdm_save_reg_p (regno))
       f->saved += 2;
-  if (f->outgoing || f->saved || f->locals || !crtl->is_leaf)
+  if (f->outgoing || f->saved || f->locals || !crtl->is_leaf
+      || tdm_may_call_byte_helper ())
     f->total = 2 + f->outgoing + f->saved + f->locals;
   else
     f->total = 0;
+}
+
+/* Whether the function has a frame, whose free word at [$sp] a call can
+   use for its return address.  */
+
+static bool
+tdm_frame_free_word_p (void)
+{
+  tdm_frame_info f;
+
+  tdm_compute_frame (&f);
+  return f.total != 0;
 }
 
 HOST_WIDE_INT

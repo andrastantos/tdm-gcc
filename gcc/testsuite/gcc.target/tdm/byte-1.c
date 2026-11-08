@@ -61,5 +61,5 @@ main (void)
 /* { dg-final { scan-assembler {\ngetb:\n(?:(?!\tif_ges\t\$r0, 0\n)[^\n]*\n)*?\t\.size\tgetb,} } } */
 /* { dg-final { scan-assembler {\nsetb:\n(?:(?!\tif_ges\t\$r0, 0\n)[^\n]*\n)*?\t\.size\tsetb,} } } */
 /* { dg-final { scan-assembler {\nnested:\n(?:(?!\tif_ges\t\$r0, 0\n)[^\n]*\n)*?\t\.size\tnested,} } } */
-/* And those of the odd-sized struct t still do.  */
-/* { dg-final { scan-assembler {\nodd_struct:\n(?:[^\n]*\n)*?\tif_ges\t\$r0, 0\n(?:[^\n]*\n)*?\t\.size\todd_struct,} } } */
+/* And those of the odd-sized struct t still do, in __tdm_load8.  */
+/* { dg-final { scan-assembler {\nodd_struct:\n(?:[^\n]*\n)*?\t\.word\t__tdm_load8\n(?:[^\n]*\n)*?\t\.size\todd_struct,} } } */
