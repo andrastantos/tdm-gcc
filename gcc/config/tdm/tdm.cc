@@ -175,6 +175,68 @@ tdm_sext16 (HOST_WIDE_INT v)
   return ((v & 0xffff) ^ 0x8000) - 0x8000;
 }
 
+/* If the memory reference EXPR is part of an object accessed through a
+   pointer whose type is aligned to a word, set *PARITY to the parity of
+   its address and return true.  GCC doesn't take the alignment of an
+   object from the type of a pointer to it, but a word field of that
+   object is accessed as a word, so the object has to be aligned.  */
+
+static bool
+tdm_pointed_to_parity (tree expr, HOST_WIDE_INT *parity)
+{
+  poly_int64 bitsize, bitpos;
+  HOST_WIDE_INT const_bitpos;
+  tree offset;
+  machine_mode mode;
+  int unsignedp, reversep, volatilep = 0;
+  tree base = get_inner_reference (expr, &bitsize, &bitpos, &offset, &mode,
+				   &unsignedp, &reversep, &volatilep);
+
+  if (TREE_CODE (base) != MEM_REF
+      || TYPE_ALIGN (TREE_TYPE (base)) < 16
+      || !bitpos.is_constant (&const_bitpos)
+      || const_bitpos % BITS_PER_UNIT != 0
+      || (offset != NULL_TREE && highest_pow2_factor (offset) < 2))
+    return false;
+  *parity = (const_bitpos / BITS_PER_UNIT) & 1;
+  return true;
+}
+
+/* Whether $r0 is known to hold an even byte pointer for the QImode
+   memory X at [$r0 + OFF].  The octet is then in the word at
+   [$r0/2 + OFF/2], in the half the parity of OFF tells; otherwise the
+   access tests the parity at run time.  The parity of the address comes
+   from the alignment of X or, as an odd offset in an aligned object
+   gives X an alignment of a byte, from that of the object it is part
+   of (or of the type of the pointer to it).  */
+
+static bool
+tdm_r0_even_p (rtx x, HOST_WIDE_INT off)
+{
+  HOST_WIDE_INT parity;
+
+  if (MEM_ALIGN (x) >= 16)
+    parity = 0;
+  else
+    {
+      unsigned int align;
+      unsigned HOST_WIDE_INT bitpos;
+      HOST_WIDE_INT moff;
+
+      if (!MEM_EXPR (x) || !MEM_OFFSET_KNOWN_P (x)
+	  || !MEM_OFFSET (x).is_constant (&moff))
+	return false;
+      if (get_object_alignment_1 (MEM_EXPR (x), &align, &bitpos)
+	  && align >= 16)
+	parity = (bitpos / BITS_PER_UNIT + moff) & 1;
+      else if (tdm_pointed_to_parity (MEM_EXPR (x), &parity))
+	parity = (parity + moff) & 1;
+      else
+	return false;
+    }
+  return ((parity ^ off) & 1) == 0;
+}
+
 /* Describe operand X.  */
 
 static tdm_loc
@@ -232,7 +294,7 @@ tdm_classify (rtx x)
 	else if (REG_P (addr) && REGNO (addr) == R0_REGNUM)
 	  {
 	    l = tdm_make_loc (LOC_R0MEM, off);
-	    l.dynamic = GET_MODE (x) == QImode && MEM_ALIGN (x) < 16;
+	    l.dynamic = GET_MODE (x) == QImode && !tdm_r0_even_p (x, off);
 	  }
 	else
 	  gcc_unreachable ();
@@ -3140,7 +3202,9 @@ tdm_regno_ok_for_base_p (unsigned int regno)
 
 /* Addresses: $sp or $r0 plus a 6-bit word offset, or an absolute word
    address from 0 to 31.  Through $r0, which holds a byte address, the
-   offset has to be even.  */
+   offset has to be even, except for an octet: an odd offset is the high
+   half of the word (see tdm_classify), which keeps the parity of $r0
+   known where that of the octet's address is.  */
 
 static bool
 tdm_legitimate_address_p (machine_mode mode, rtx x, bool strict,
@@ -3178,7 +3242,7 @@ tdm_legitimate_address_p (machine_mode mode, rtx x, bool strict,
     return true;
   else if (regno != R0_REGNUM)
     return false;
-  if ((off & 1) != 0)
+  if ((off & 1) != 0 && size != 1)
     return false;
   return off >> 1 >= -32 && (off + size - 1) >> 1 <= 31;
 }
