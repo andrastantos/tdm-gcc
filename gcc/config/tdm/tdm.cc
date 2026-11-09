@@ -3613,6 +3613,43 @@ tdm_vector_alignment (const_tree type)
   return MIN (default_vector_alignment (type), BIGGEST_ALIGNMENT);
 }
 
+/* Block operations.  Whether a copy, clear or fill of SIZE octets at
+   ALIGN bits is done inline, piece by piece, or by a call to memcpy or
+   memset (no cpymem/setmem patterns).  Speed doesn't matter: smaller
+   wins.
+
+   A call costs about 9 words.  A word piece costs 2 words when one
+   side is the stack or a constant address, which is common (arguments
+   by value, locals), more when both go through $r0; a store of a word
+   about 1.  An octet piece of unknown half needs a call to a byte
+   helper or the inline run-time test (see tdm_r0_even_p): moving one
+   is two of those, at least as much as the call to memcpy.  GCC's
+   defaults (MOVE_RATIO etc.: 15 pieces, 3 at -Os) count octet pieces
+   like word pieces.  Limits chosen by measuring the execute tests at
+   -O2 and -Os, libc and linked programs (2026-11-09): fewer than 8 word
+   moves inline makes calls with structs by value bigger, more makes
+   libc bigger (copies through two pointers).  */
+
+static bool
+tdm_use_by_pieces_infrastructure_p (unsigned HOST_WIDE_INT size,
+				    unsigned int align,
+				    enum by_pieces_operation op, bool speed_p)
+{
+  if (op == COMPARE_BY_PIECES)
+    return default_use_by_pieces_infrastructure_p (size, align, op, speed_p);
+
+  unsigned HOST_WIDE_INT words = 0, octets = size;
+  if (align >= BITS_PER_WORD)
+    {
+      words = size / UNITS_PER_WORD;
+      octets = size % UNITS_PER_WORD;
+    }
+  if (op == MOVE_BY_PIECES)
+    return octets == 0 && words <= 8;
+  /* CLEAR_BY_PIECES, SET_BY_PIECES, STORE_BY_PIECES.  */
+  return octets <= 1 && words + 7 * octets <= 12;
+}
+
 /* Miscellaneous.  */
 
 static void
@@ -3710,6 +3747,10 @@ tdm_init_libfuncs (void)
 #define TARGET_CONSTANT_ALIGNMENT tdm_constant_alignment
 #undef  TARGET_VECTOR_ALIGNMENT
 #define TARGET_VECTOR_ALIGNMENT tdm_vector_alignment
+
+#undef  TARGET_USE_BY_PIECES_INFRASTRUCTURE_P
+#define TARGET_USE_BY_PIECES_INFRASTRUCTURE_P \
+  tdm_use_by_pieces_infrastructure_p
 
 #undef  TARGET_TRAMPOLINE_INIT
 #define TARGET_TRAMPOLINE_INIT tdm_trampoline_init
