@@ -238,8 +238,8 @@ tdm_r0_even_p (rtx x, HOST_WIDE_INT off)
 }
 
 /* Whether the function may access an octet through $r0 whose half of
-   the word isn't known, which calls a byte access helper (see
-   tdm_emit_byte_helper_call).  Such a function needs a frame, whose free
+   the word isn't known, or that is the high half, which calls a byte
+   access helper (see tdm_emit_byte_helper_call).  Such a function needs a frame, whose free
    word at [$sp] takes the return address.  The frame can't change once
    register allocation starts, so the answer is kept from then on; it
    comes from the octets in memory not addressed through $sp, the frame
@@ -283,7 +283,8 @@ tdm_may_call_byte_helper (void)
 		  || REGNO (addr) == HARD_FRAME_POINTER_REGNUM
 		  || VIRTUAL_REGISTER_NUM_P (REGNO (addr))))
 	    continue;
-	  if (!tdm_r0_even_p (x, off))
+	  /* An octet whose half isn't known, or the high one.  */
+	  if (!tdm_r0_even_p (x, off) || (off & 1) != 0)
 	    {
 	      found = true;
 	      break;
@@ -1498,7 +1499,11 @@ tdm_emit_movqi (const tdm_loc &d, const tdm_loc &s)
     {
       tdm_loc w = s;
 
-      if (s.dynamic)
+      /* The helper is smaller than shifting the high half down, if it
+	 can be called (see tdm_emit_load_octet_dynamic).  */
+      if (s.dynamic
+	  || (s.kind == LOC_R0MEM && s.high && !s.word
+	      && tdm_frame_free_word_p ()))
 	{
 	  tdm_emit_load_octet_dynamic (d, s.n * 2 + s.high);
 	  return;
@@ -1515,7 +1520,12 @@ tdm_emit_movqi (const tdm_loc &d, const tdm_loc &s)
       bool wrap = tdm_wrap_p (d);
       tdm_loc w = d;
 
-      if (d.dynamic)
+      /* For the high half, as for loads above, if the helper can be
+	 called (see tdm_emit_store_octet_dynamic).  */
+      if (d.dynamic
+	  || (d.kind == LOC_R0MEM && d.high && !d.word
+	      && tdm_frame_free_word_p ()
+	      && (s.kind == LOC_R1 || tdm_r1_free_p ())))
 	{
 	  tdm_emit_store_octet_dynamic (s, d.n * 2 + d.high);
 	  return;
