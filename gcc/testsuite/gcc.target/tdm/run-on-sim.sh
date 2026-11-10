@@ -2,8 +2,8 @@
 # Run the TDM run tests by hand on tdm-elf-run, until a DejaGnu board
 # for the simulator exists.  Each test is compiled with the options of
 # its dg-options/dg-additional-options lines at several optimization
-# levels, linked with sim-crt0.s (no libc), and run; main's result is
-# the exit code.
+# levels, linked with sim-crt0.s and libgcc (no libc), and run; main's
+# result is the exit code.
 #
 # Usage: run-on-sim.sh [test.c ...]	(default: all *.c here)
 # Environment: GCC_BUILD (the build's gcc directory, default
@@ -26,6 +26,8 @@ if [ $# -eq 0 ]; then
 fi
 
 "$tools/tdm-elf-as" -o "$work/crt0.o" "$here/sim-crt0.s" || exit 1
+# For __tdm_save_N and the other helpers the compiler calls.
+libgcc=$("$gcc_build/xgcc" -B"$gcc_build" -print-libgcc-file-name)
 
 pass=0
 fail=0
@@ -42,7 +44,7 @@ for src in "$@"; do
       fail=$((fail + 1)); continue
     fi
     if ! "$tools/tdm-elf-ld" -o "$base.elf" "$work/crt0.o" "$base.o" \
-	   > "$base.log" 2>&1; then
+	   "$libgcc" > "$base.log" 2>&1; then
       echo "FAIL: $tag (link)"; sed 's/^/  /' "$base.log" | head -5
       fail=$((fail + 1)); continue
     fi

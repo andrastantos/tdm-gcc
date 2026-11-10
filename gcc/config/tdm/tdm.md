@@ -43,7 +43,9 @@
 (define_c_enum "unspecv"
   [UNSPECV_BLOCKAGE
    UNSPECV_NONLOCAL_JUMP
-   UNSPECV_POOL])
+   UNSPECV_POOL
+   UNSPECV_SAVE
+   UNSPECV_RESTORE])
 
 ;; Lengths are in octets, two per instruction.  tdm_insn_length counts
 ;; the instructions the output functions emit.
@@ -399,6 +401,27 @@
   tdm_expand_epilogue (true);
   DONE;
 })
+
+;; Out-of-line saves and restores of the callee-saved registers
+;; $mr19 to $mr18+N (see tdm_expand_prologue).  Operand 1 is the
+;; libgcc routine, __tdm_save_N or __tdm_restore_N.  The save is
+;; called like any function; the restore is jumped to with the amount
+;; to add to $sp (operand 2) in [$sp], and returns for the function.
+
+(define_insn "tdm_save_call"
+  [(match_parallel 0 "tdm_save_operation"
+     [(unspec_volatile [(match_operand:HI 1 "" "")] UNSPECV_SAVE)])]
+  "reload_completed"
+  "* return tdm_output_save_call (operands[1]);")
+
+(define_insn "tdm_restore_return"
+  [(match_parallel 0 "tdm_restore_operation"
+     [(return)
+      (unspec_volatile [(match_operand:HI 1 "" "")
+			(match_operand:HI 2 "const_int_operand" "")]
+		       UNSPECV_RESTORE)])]
+  "reload_completed"
+  "* return tdm_output_restore_return (operands[1], operands[2]);")
 
 (define_insn "return_internal"
   [(return)]

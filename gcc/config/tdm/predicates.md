@@ -25,3 +25,11 @@
 (define_predicate "call_address_operand"
   (ior (match_code "symbol_ref")
        (match_operand 0 "register_operand")))
+
+;; The PARALLELs of tdm_save_call and tdm_restore_return, built by
+;; tdm_expand_prologue and tdm_expand_epilogue.
+(define_special_predicate "tdm_save_operation"
+  (match_code "parallel"))
+
+(define_special_predicate "tdm_restore_operation"
+  (match_code "parallel"))
