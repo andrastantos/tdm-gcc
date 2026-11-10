@@ -201,6 +201,60 @@
   "tdm_operand_pair_ok_p (operands[0], operands[1])"
   "* return tdm_output_unop (NOT, operands);")
 
+;; 32-bit addition, subtraction and negation, word by word: the carry
+;; is a predicated add or subtract of 1 (see tdm_expand_si_arith).
+
+(define_expand "addsi3"
+  [(set (match_operand:SI 0 "nonimmediate_operand")
+	(plus:SI (match_operand:SI 1 "nonimmediate_operand")
+		 (match_operand:SI 2 "general_operand")))]
+  ""
+{
+  tdm_expand_si_arith (PLUS, operands);
+  DONE;
+})
+
+(define_expand "subsi3"
+  [(set (match_operand:SI 0 "nonimmediate_operand")
+	(minus:SI (match_operand:SI 1 "nonimmediate_operand")
+		  (match_operand:SI 2 "general_operand")))]
+  ""
+{
+  tdm_expand_si_arith (MINUS, operands);
+  DONE;
+})
+
+(define_expand "negsi2"
+  [(set (match_operand:SI 0 "nonimmediate_operand")
+	(neg:SI (match_operand:SI 1 "nonimmediate_operand")))]
+  ""
+{
+  tdm_expand_si_arith (NEG, operands);
+  DONE;
+})
+
+;; Operand 0 plus (minus) 1 if the comparison holds.  Both the operand
+;; and the compared one are best in real registers; otherwise the
+;; output swaps them into one for the time being
+;; (tdm_output_cond_step).
+(define_insn "tdm_cond_addhi"
+  [(set (match_operand:HI 0 "register_operand" "=q,?r")
+	(plus:HI (match_operator:HI 4 "tdm_cbranch_operator"
+		   [(match_operand:HI 2 "register_operand" "q,r")
+		    (match_operand:HI 3 "general_operand" "rQI,rQI")])
+		 (match_operand:HI 1 "register_operand" "0,0")))]
+  ""
+  "* return tdm_output_cond_step (\"add\", operands);")
+
+(define_insn "tdm_cond_subhi"
+  [(set (match_operand:HI 0 "register_operand" "=q,?r")
+	(minus:HI (match_operand:HI 1 "register_operand" "0,0")
+		  (match_operator:HI 4 "tdm_cbranch_operator"
+		    [(match_operand:HI 2 "register_operand" "q,r")
+		     (match_operand:HI 3 "general_operand" "rQI,rQI")])))]
+  ""
+  "* return tdm_output_cond_step (\"sub\", operands);")
+
 ;; Shifts by a constant are rotates and a mask; other shifts are
 ;; library calls.
 

@@ -1953,6 +1953,67 @@ tdm_output_cbranch (rtx *operands, rtx_insn *insn)
   return "";
 }
 
+/* Output tdm_cond_addhi or tdm_cond_subhi: add or subtract (OP) 1
+   from operand 0 if operand 4, comparing operands 2 and 3, holds.  The
+   predicate compares a real register with an OPB operand, and only a
+   real register takes "add 1": an operand in a memory register is
+   swapped into a real one and back, which leaves every other value as
+   it was.  The compared operand goes to the scratch word if it is in a
+   real register that is swapped, or in $r1, which OPB can't name.
+   After reload it can be the same as one of the other operands.  */
+
+const char *
+tdm_output_cond_step (const char *op, rtx *operands)
+{
+  tdm_loc d = tdm_classify (operands[0]);
+  tdm_loc a = tdm_classify (operands[2]);
+  tdm_loc b = tdm_classify (operands[3]);
+  bool same = rtx_equal_p (operands[0], operands[2]);
+  tdm_loc rd = d, ra = a;
+  bool swap_d = !tdm_reg_loc_p (d), swap_a = !same && !tdm_reg_loc_p (a);
+
+  /* Pick the real registers.  */
+  if (swap_d)
+    rd = tdm_make_loc (a.kind == LOC_R1 ? LOC_R0 : LOC_R1);
+  if (same)
+    ra = rd;
+  else if (swap_a)
+    ra = tdm_make_loc (rd.kind == LOC_R1 ? LOC_R0 : LOC_R1);
+  gcc_assert (same || ra.kind != rd.kind);
+
+  /* The compared operand may be either of the others: the compare comes
+     first.  A real register that is swapped goes to the scratch word
+     before; a memory location that is swapped is in its real register
+     after.  */
+  if (tdm_reg_loc_p (b)
+      && ((swap_d && rd.kind == b.kind) || (swap_a && ra.kind == b.kind)))
+    {
+      tdm_emit ("mov\t[$sp-1], %s", tdm_reg_text (b));
+      b = tdm_make_loc (LOC_SCRATCH);
+    }
+  if (swap_d)
+    tdm_emit ("swap\t%s, %s", tdm_reg_text (rd), tdm_opb_text (d));
+  if (swap_a)
+    tdm_emit ("swap\t%s, %s", tdm_reg_text (ra), tdm_opb_text (a));
+  if (swap_d && tdm_loc_equal_p (b, d))
+    b = rd;
+  else if (swap_a && tdm_loc_equal_p (b, a))
+    b = ra;
+  if (b.kind == LOC_R1)
+    {
+      tdm_emit ("mov\t[$sp-1], $r1");
+      b = tdm_make_loc (LOC_SCRATCH);
+    }
+  tdm_emit ("if_%s\t%s, %s", tdm_condition_name (GET_CODE (operands[4])),
+	    tdm_reg_text (ra), tdm_opb_text (b));
+  tdm_emit ("%s\t%s, 1", op, tdm_reg_text (rd));
+  if (swap_a)
+    tdm_emit ("swap\t%s, %s", tdm_reg_text (ra), tdm_opb_text (a));
+  if (swap_d)
+    tdm_emit ("swap\t%s, %s", tdm_reg_text (rd), tdm_opb_text (d));
+  return "";
+}
+
 const char *
 tdm_output_jump (rtx label, rtx_insn *insn)
 {
@@ -2777,6 +2838,60 @@ tdm_reorg (void)
 	       (int) pools.length (), barrier_pools, live, pooled, reverted,
 	       rejoined, (int) uses.length () - pooled);
     }
+}
+
+/* 32-bit addition, subtraction and negation (CODE) of OPERANDS, word
+   by word.  There is no carry flag: the carry (borrow) is the unsigned
+   compare of the low words, and a predicate instruction adds it to the
+   high word (tdm_cond_addhi, tdm_cond_subhi).  The words go through
+   new registers, so that operands may overlap.  */
+
+void
+tdm_expand_si_arith (enum rtx_code code, rtx *operands)
+{
+  rtx lo1 = operand_subword_force (operands[1], 0, SImode);
+  rtx hi1 = operand_subword_force (operands[1], 1, SImode);
+  rtx lo = gen_reg_rtx (HImode), hi = gen_reg_rtx (HImode);
+  rtx v;
+
+  if (code == NEG)
+    {
+      /* -x = ~x + 1: the carry is the low word being 0.  */
+      emit_move_insn (lo, expand_simple_unop (HImode, NEG, lo1, lo, 0));
+      emit_move_insn (hi, expand_simple_unop (HImode, NOT, hi1, hi, 0));
+      emit_insn (gen_tdm_cond_addhi (hi, hi, lo, const0_rtx,
+				     gen_rtx_EQ (HImode, lo, const0_rtx)));
+    }
+  else
+    {
+      rtx lo2 = operand_subword_force (operands[2], 0, SImode);
+      rtx hi2 = operand_subword_force (operands[2], 1, SImode);
+      bool carry = lo2 != const0_rtx;
+      /* The operand compared with: a register, or a small constant.  */
+      rtx b = lo2;
+      if (code == MINUS)
+	lo1 = force_reg (HImode, lo1);
+      else if (MEM_P (b) || (CONST_INT_P (b) && !IN_RANGE (INTVAL (b), -32, 31)))
+	b = REG_P (lo1) ? lo1 : force_reg (HImode, lo2);
+      if (code == MINUS && CONST_INT_P (b) && !IN_RANGE (INTVAL (b), -32, 31))
+	b = force_reg (HImode, b);
+
+      v = expand_simple_binop (HImode, code, lo1, b == lo1 ? lo2 : b, lo, 0,
+			       OPTAB_LIB_WIDEN);
+      emit_move_insn (lo, v);
+      v = expand_simple_binop (HImode, code, hi1, hi2, hi, 0, OPTAB_LIB_WIDEN);
+      emit_move_insn (hi, v);
+      if (carry && code == PLUS)
+	/* lo = lo1 + lo2 carries iff lo < lo2 (and lo < lo1).  */
+	emit_insn (gen_tdm_cond_addhi (hi, hi, lo, b,
+				       gen_rtx_LTU (HImode, lo, b)));
+      else if (carry)
+	/* lo1 - lo2 borrows iff lo1 < lo2.  */
+	emit_insn (gen_tdm_cond_subhi (hi, hi, lo1, b,
+				       gen_rtx_LTU (HImode, lo1, b)));
+    }
+  emit_move_insn (operand_subword (operands[0], 0, 1, SImode), lo);
+  emit_move_insn (operand_subword (operands[0], 1, 1, SImode), hi);
 }
 
 /* Branch expansion.  The predicate instructions compare a register

@@ -20,6 +20,8 @@ extern HOST_WIDE_INT tdm_initial_elimination_offset (int, int);
 extern void tdm_expand_prologue (void);
 extern void tdm_expand_epilogue (bool);
 extern void tdm_expand_cbranch (rtx *);
+extern void tdm_expand_si_arith (enum rtx_code, rtx *);
+extern const char *tdm_output_cond_step (const char *, rtx *);
 extern bool tdm_q_memory_p (rtx);
 extern bool tdm_operand_pair_ok_p (rtx, rtx);
 extern void tdm_expand_store (rtx *, machine_mode);
