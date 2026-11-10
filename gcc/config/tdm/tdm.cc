@@ -1985,6 +1985,25 @@ tdm_output_call (rtx addr)
   return "";
 }
 
+/* Call SYM, a __tdm_save_N routine.  */
+
+const char *
+tdm_output_save_call (rtx sym)
+{
+  return tdm_output_call (sym);
+}
+
+/* Jump to SYM, a __tdm_restore_N routine, with INC in [$sp].  */
+
+const char *
+tdm_output_restore_return (rtx sym, rtx inc)
+{
+  tdm_emit_to_reg ("mov", tdm_r1, tdm_make_loc (LOC_IMM, INTVAL (inc)));
+  tdm_emit ("mov\t[$sp], $r1");
+  tdm_emit_to_reg ("mov", tdm_make_loc (LOC_PC), tdm_classify (sym));
+  return "";
+}
+
 /* The length of INSN, in octets: count what its output function
    emits.  If LITS is given, add the literals it emits there.  */
 
@@ -3102,15 +3121,45 @@ tdm_fix_operand_pairs (rtx *operands, int n)
 /* Frame layout, from $sp up: a free word, the outgoing arguments, the
    saved registers and the local variables.  A leaf function without
    any of these, that calls no byte access helper either, has no frame:
-   its return address is at [$sp].  */
+   its return address is at [$sp].
+
+   Out of line saves: the callee-saved registers $mr19 to $mr18+N (N
+   at least tdm_ool_restore_min, together with any unused ones in
+   between) form a block that libgcc's __tdm_save_N stores at [$sp+1] to [$sp+N] and
+   __tdm_restore_N loads from there.  In a function without outgoing
+   arguments the block comes right after the free word, and the
+   prologue calls __tdm_save_N after allocating the frame.  Otherwise
+   it is at the top of the frame, below the return address: the
+   prologue allocates N+1 words, calls __tdm_save_N and allocates the
+   rest.  Other saved registers ($mr6) are saved inline, after the
+   outgoing arguments (or the block).
+
+   The epilogue frees the frame down to where $sp was at the call,
+   stores what is left to free in [$sp] and jumps to __tdm_restore_N,
+   which adds it to $sp and returns.  It changes $r1, so a function
+   whose return value is in $r1 restores inline, as does a sibling
+   call epilogue.
+
+   A save with fewer than tdm_ool_save_min registers stores the block
+   inline.  */
 
 struct tdm_frame_info
 {
   HOST_WIDE_INT outgoing;
-  HOST_WIDE_INT saved;
+  HOST_WIDE_INT saved;		/* Registers saved one by one.  */
   HOST_WIDE_INT locals;
   HOST_WIDE_INT total;
+  int ool_n;			/* Size of the block in words, or 0.  */
+  bool ool_save;		/* Whether the prologue calls __tdm_save_N.  */
+  bool bottom;			/* Whether the block follows the free word.  */
 };
+
+/* The least N for an out of line save, and for a restore: a call to
+   __tdm_save_N costs 4 words (with the literal) against 2N inline, and
+   the jump to __tdm_restore_N 4 against 2N + 1.  N = 2 only ties for the
+   save: measured, saving inline then is smaller than calling.  */
+
+static const int tdm_ool_save_min = 3, tdm_ool_restore_min = 2;
 
 static bool
 tdm_save_reg_p (unsigned int regno)
@@ -3121,20 +3170,58 @@ tdm_save_reg_p (unsigned int regno)
 	  && !call_used_or_fixed_reg_p (regno));
 }
 
+#define TDM_OOL_FIRST (MR0_REGNUM + 19)
+
+/* Whether REGNO is saved in the block of F.  */
+
+static bool
+tdm_ool_reg_p (const tdm_frame_info *f, unsigned int regno)
+{
+  return regno >= TDM_OOL_FIRST && regno < TDM_OOL_FIRST + f->ool_n;
+}
+
 static void
 tdm_compute_frame (tdm_frame_info *f)
 {
   f->outgoing = ROUND_UP (crtl->outgoing_args_size, 2);
   f->locals = ROUND_UP (get_frame_size (), 2);
+  f->ool_n = 0;
+  for (int n = MR31_REGNUM - TDM_OOL_FIRST + 1; n > 0; n--)
+    if (tdm_save_reg_p (TDM_OOL_FIRST + n - 1))
+      {
+	if (n >= MIN (tdm_ool_save_min, tdm_ool_restore_min))
+	  f->ool_n = n;
+	break;
+      }
+  f->ool_save = f->ool_n >= tdm_ool_save_min;
+  f->bottom = f->ool_n && !f->outgoing;
   f->saved = 0;
   for (unsigned int regno = MR0_REGNUM; regno <= MR31_REGNUM; regno++)
-    if (tdm_save_reg_p (regno))
+    if (tdm_save_reg_p (regno) && !tdm_ool_reg_p (f, regno))
       f->saved += 2;
-  if (f->outgoing || f->saved || f->locals || !crtl->is_leaf
+  if (f->outgoing || f->saved || f->locals || f->ool_n || !crtl->is_leaf
       || tdm_may_call_byte_helper ())
-    f->total = 2 + f->outgoing + f->saved + f->locals;
+    f->total = 2 + f->outgoing + f->saved + f->locals + 2 * f->ool_n;
   else
     f->total = 0;
+}
+
+/* Where $sp is, in octets above its final value, when __tdm_save_N
+   and __tdm_restore_N run: register $mr18+K of the block is at
+   [$sp+K] there.  */
+
+static HOST_WIDE_INT
+tdm_ool_base (const tdm_frame_info *f)
+{
+  return f->bottom ? 0 : f->total - 2 * (f->ool_n + 1);
+}
+
+/* The offset of the first register saved one by one.  */
+
+static HOST_WIDE_INT
+tdm_inline_saves (const tdm_frame_info *f)
+{
+  return 2 + (f->bottom ? 2 * f->ool_n : f->outgoing);
 }
 
 /* Whether the function has a frame, whose free word at [$sp] a call can
@@ -3161,7 +3248,7 @@ tdm_initial_elimination_offset (int from, int to)
   if (from == ARG_POINTER_REGNUM)
     return f.total;
   gcc_assert (from == FRAME_POINTER_REGNUM);
-  return f.total ? 2 + f.outgoing + f.saved : 0;
+  return f.total ? tdm_inline_saves (&f) + f.saved : 0;
 }
 
 /* Call frame information counts words (see tdm.h), so the frame
@@ -3193,6 +3280,55 @@ tdm_save_slot (HOST_WIDE_INT off, bool words)
 					       words ? off / 2 : off));
 }
 
+/* The libgcc routine __tdm_KIND_N.  */
+
+static rtx
+tdm_ool_symbol (const char *kind, int n)
+{
+  char buf[32];
+
+  snprintf (buf, sizeof buf, "__tdm_%s_%d", kind, n);
+  rtx sym = gen_rtx_SYMBOL_REF (Pmode, ggc_strdup (buf));
+  SYMBOL_REF_FLAGS (sym) |= SYMBOL_FLAG_FUNCTION;
+  return sym;
+}
+
+/* Save REGNO in the slot OFF octets above $sp.  */
+
+static void
+tdm_emit_save (unsigned int regno, HOST_WIDE_INT off)
+{
+  rtx reg = gen_rtx_REG (HImode, regno);
+  rtx slot = tdm_save_slot (off, false);
+  rtx_insn *insn;
+
+  /* The caller's frame pointer is a word address: keep it so.  */
+  if (regno == HARD_FRAME_POINTER_REGNUM && frame_pointer_needed)
+    insn = emit_insn (gen_tdm_save_fp (slot));
+  else
+    insn = emit_move_insn (slot, reg);
+  RTX_FRAME_RELATED_P (insn) = 1;
+  add_reg_note (insn, REG_CFA_OFFSET,
+		gen_rtx_SET (tdm_save_slot (off, true), reg));
+}
+
+/* Restore REGNO from the slot OFF octets above $sp.  */
+
+static void
+tdm_emit_restore (unsigned int regno, HOST_WIDE_INT off)
+{
+  rtx reg = gen_rtx_REG (HImode, regno);
+  rtx slot = tdm_save_slot (off, false);
+  rtx_insn *insn;
+
+  if (regno == HARD_FRAME_POINTER_REGNUM && frame_pointer_needed)
+    insn = emit_insn (gen_tdm_restore_fp (slot));
+  else
+    insn = emit_move_insn (reg, slot);
+  RTX_FRAME_RELATED_P (insn) = 1;
+  add_reg_note (insn, REG_CFA_RESTORE, reg);
+}
+
 void
 tdm_expand_prologue (void)
 {
@@ -3202,25 +3338,46 @@ tdm_expand_prologue (void)
   tdm_compute_frame (&f);
   if (flag_stack_usage_info)
     current_function_static_stack_size = f.total;
-  if (f.total)
-    tdm_emit_sp_adjust (-f.total);
 
-  off = 2 + f.outgoing;
-  for (unsigned int regno = MR0_REGNUM; regno <= MR31_REGNUM; regno++)
-    if (tdm_save_reg_p (regno))
-      {
-	rtx reg = gen_rtx_REG (HImode, regno);
-	rtx slot = tdm_save_slot (off, false);
-	rtx_insn *insn;
+  HOST_WIDE_INT base = tdm_ool_base (&f);
+  if (f.ool_save)
+    {
+      int n = f.ool_n;
+      rtvec v = rtvec_alloc (2 + n);
 
-	/* The caller's frame pointer is a word address: keep it so.  */
-	if (regno == HARD_FRAME_POINTER_REGNUM && frame_pointer_needed)
-	  insn = emit_insn (gen_tdm_save_fp (slot));
-	else
-	  insn = emit_move_insn (slot, reg);
-	RTX_FRAME_RELATED_P (insn) = 1;
+      tdm_emit_sp_adjust (-(f.total - base));
+      RTVEC_ELT (v, 0)
+	= gen_rtx_UNSPEC_VOLATILE (VOIDmode,
+				   gen_rtvec (1, tdm_ool_symbol ("save", n)),
+				   UNSPECV_SAVE);
+      RTVEC_ELT (v, 1) = gen_rtx_CLOBBER (VOIDmode,
+					  gen_rtx_REG (HImode, R1_REGNUM));
+      for (int k = 1; k <= n; k++)
+	RTVEC_ELT (v, 1 + k)
+	  = gen_rtx_USE (VOIDmode, gen_rtx_REG (HImode, TDM_OOL_FIRST + k - 1));
+      rtx_insn *insn = emit_insn (gen_rtx_PARALLEL (VOIDmode, v));
+      RTX_FRAME_RELATED_P (insn) = 1;
+      for (int k = 1; k <= n; k++)
 	add_reg_note (insn, REG_CFA_OFFSET,
-		      gen_rtx_SET (tdm_save_slot (off, true), reg));
+		      gen_rtx_SET (tdm_save_slot (2 * k, true),
+				   gen_rtx_REG (HImode,
+						TDM_OOL_FIRST + k - 1)));
+      if (base)
+	tdm_emit_sp_adjust (-base);
+    }
+  else
+    {
+      if (f.total)
+	tdm_emit_sp_adjust (-f.total);
+      for (int k = 1; k <= f.ool_n; k++)
+	tdm_emit_save (TDM_OOL_FIRST + k - 1, base + 2 * k);
+    }
+
+  off = tdm_inline_saves (&f);
+  for (unsigned int regno = MR0_REGNUM; regno <= MR31_REGNUM; regno++)
+    if (tdm_save_reg_p (regno) && !tdm_ool_reg_p (&f, regno))
+      {
+	tdm_emit_save (regno, off);
 	off += 2;
       }
 
@@ -3234,6 +3391,20 @@ tdm_expand_prologue (void)
 				   f.total / 2));
       emit_insn (gen_blockage ());
     }
+}
+
+/* Whether the function returns a value in $r1, which __tdm_restore_N
+   changes.  */
+
+static bool
+tdm_return_in_r1_p (void)
+{
+  rtx r = crtl->return_rtx;
+
+  if (!r)
+    return false;
+  return !(REG_P (r) && REGNO (r) == R0_REGNUM
+	   && GET_MODE_SIZE (GET_MODE (r)) <= UNITS_PER_WORD);
 }
 
 /* Restore the registers and $sp, then return.  For a sibling call
@@ -3260,23 +3431,37 @@ tdm_expand_epilogue (bool sibcall)
       add_reg_note (insn, REG_CFA_DEF_CFA,
 		    plus_constant (Pmode, stack_pointer_rtx, f.total / 2));
     }
-  off = 2 + f.outgoing;
+  off = tdm_inline_saves (&f);
   for (unsigned int regno = MR0_REGNUM; regno <= MR31_REGNUM; regno++)
-    if (tdm_save_reg_p (regno))
+    if (tdm_save_reg_p (regno) && !tdm_ool_reg_p (&f, regno))
       {
-	rtx reg = gen_rtx_REG (HImode, regno);
-	rtx slot = tdm_save_slot (off, false);
-	rtx_insn *insn;
-
-	if (regno == HARD_FRAME_POINTER_REGNUM && frame_pointer_needed)
-	  insn = emit_insn (gen_tdm_restore_fp (slot));
-	else
-	  insn = emit_move_insn (reg, slot);
-
-	RTX_FRAME_RELATED_P (insn) = 1;
-	add_reg_note (insn, REG_CFA_RESTORE, reg);
+	tdm_emit_restore (regno, off);
 	off += 2;
       }
+
+  HOST_WIDE_INT base = tdm_ool_base (&f);
+  if (!sibcall && f.ool_n >= tdm_ool_restore_min && !tdm_return_in_r1_p ())
+    {
+      int n = f.ool_n;
+
+      emit_insn (gen_blockage ());
+      if (base)
+	tdm_emit_sp_adjust (base);
+      rtvec v = rtvec_alloc (3);
+      RTVEC_ELT (v, 0) = ret_rtx;
+      RTVEC_ELT (v, 1)
+	= gen_rtx_UNSPEC_VOLATILE (VOIDmode,
+				   gen_rtvec (2, tdm_ool_symbol ("restore", n),
+					      GEN_INT ((f.total - base) / 2)),
+				   UNSPECV_RESTORE);
+      RTVEC_ELT (v, 2) = gen_rtx_CLOBBER (VOIDmode,
+					  gen_rtx_REG (HImode, R1_REGNUM));
+      rtx_insn *jump = emit_jump_insn (gen_rtx_PARALLEL (VOIDmode, v));
+      JUMP_LABEL (jump) = ret_rtx;
+      return;
+    }
+  for (int k = 1; k <= f.ool_n; k++)
+    tdm_emit_restore (TDM_OOL_FIRST + k - 1, base + 2 * k);
   if (f.total)
     {
       emit_insn (gen_blockage ());

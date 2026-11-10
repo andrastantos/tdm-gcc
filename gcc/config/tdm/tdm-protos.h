@@ -39,6 +39,8 @@ extern const char *tdm_output_pool (rtx, rtx);
 extern const char *tdm_output_jump (rtx, rtx_insn *);
 extern const char *tdm_output_indirect_jump (rtx);
 extern const char *tdm_output_call (rtx);
+extern const char *tdm_output_save_call (rtx);
+extern const char *tdm_output_restore_return (rtx, rtx);
 extern void tdm_output_skip (FILE *, unsigned HOST_WIDE_INT);
 extern void tdm_output_ascii (FILE *, const char *, int);
 

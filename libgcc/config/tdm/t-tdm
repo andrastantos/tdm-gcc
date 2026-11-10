@@ -10,6 +10,10 @@ LIB2ADD += $(srcdir)/config/tdm/lib2-hi.c \
 # compiler doesn't know, called with a convention of their own.
 LIB2ADD += $(srcdir)/config/tdm/tdm-byte.S
 
+# Out of line saves and restores of the callee-saved registers, which
+# the prologues and epilogues call.
+LIB2ADD += $(srcdir)/config/tdm/tdm-save.S
+
 # Memory is small: optimize for size, and put each function in a section
 # of its own, so that the link (--gc-sections) keeps only those used.
 # This comes after libgcc's own -O2.
