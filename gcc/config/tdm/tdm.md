@@ -280,6 +280,22 @@
   "tdm_operand_pair_ok_p (operands[0], operands[1])"
   "* return tdm_output_shift (<CODE>, operands);")
 
+;; 32-bit shifts by a constant: a call to libgcc's __ashlsi3, __lshrsi3
+;; or __ashrsi3 where that is smaller than shifting the words inline
+;; (tdm_expand_si_shift).  Otherwise, and for shifts by a variable
+;; amount (a call anyway), the expander fails.
+
+(define_expand "<shift_insn>si3"
+  [(set (match_operand:SI 0 "nonimmediate_operand")
+	(any_shift:SI (match_operand:SI 1 "nonimmediate_operand")
+		      (match_operand:HI 2 "general_operand")))]
+  ""
+{
+  if (!tdm_expand_si_shift (<CODE>, operands))
+    FAIL;
+  DONE;
+})
+
 ;; -------------------------------------------------------------------
 ;; Branches
 ;; -------------------------------------------------------------------
