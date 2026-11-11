@@ -2894,6 +2894,56 @@ tdm_expand_si_arith (enum rtx_code code, rtx *operands)
   emit_move_insn (operand_subword (operands[0], 1, 1, SImode), hi);
 }
 
+/* The size in words of a function returning a 32-bit argument shifted
+   by 1 to 31 inline, as GCC expands it word by word (rotates and
+   masks), for left, logical right and arithmetic right shifts; a call
+   to the libgcc function in the same place is 13.  Measured at -Os.  */
+
+static const unsigned char tdm_si_shift_words[3][31] = {
+  { 13, 16, 19, 22, 25, 30, 33, 34, 33, 30, 27, 24, 21, 18, 14, 3,
+    5, 6, 7, 8, 9, 11, 12, 12, 12, 11, 10, 9, 8, 7, 6 },
+  { 14, 18, 21, 24, 27, 30, 33, 34, 33, 30, 25, 22, 19, 16, 13, 3,
+    5, 7, 8, 9, 10, 11, 12, 12, 12, 11, 9, 8, 7, 6, 5 },
+  { 17, 21, 24, 27, 30, 33, 36, 37, 36, 33, 27, 24, 21, 18, 15, 7,
+    13, 15, 16, 17, 18, 19, 20, 20, 20, 19, 16, 15, 14, 13, 7 }
+};
+
+/* How much bigger the inline shift has to be for a call: a call also
+   changes the caller-saved registers.  Measured: 3 is a little smaller
+   than 0 and 6 in the libraries.  */
+
+static const int tdm_si_shift_margin = 3;
+
+/* Expand the 32-bit shift CODE of OPERANDS as a library call if the
+   amount is a constant for which that is smaller; return whether it
+   did.  */
+
+bool
+tdm_expand_si_shift (enum rtx_code code, rtx *operands)
+{
+  if (!CONST_INT_P (operands[2]) || !IN_RANGE (INTVAL (operands[2]), 1, 31))
+    return false;
+  int k = code == ASHIFT ? 0 : code == LSHIFTRT ? 1 : 2;
+  if (tdm_si_shift_words[k][INTVAL (operands[2]) - 1]
+      < 13 + tdm_si_shift_margin)
+    return false;
+  optab op = code == ASHIFT ? ashl_optab
+	     : code == LSHIFTRT ? lshr_optab : ashr_optab;
+  rtx fn = optab_libfunc (op, SImode);
+  /* libgcc's __ashlsi3 and the others shift by constants themselves.  */
+  if (current_function_decl
+      && !strcmp (XSTR (fn, 0),
+		  IDENTIFIER_POINTER (DECL_ASSEMBLER_NAME
+				      (current_function_decl))))
+    return false;
+  rtx v = emit_library_call_value (fn, operands[0],
+				   LCT_CONST, SImode, operands[1], SImode,
+				   operands[2], HImode);
+  if (v != operands[0])
+    emit_move_insn (operands[0], v);
+  return true;
+}
+
 /* Branch expansion.  The predicate instructions compare a register
    with a second operand; unsigned > and <= are only available with the
    operands swapped.  */
