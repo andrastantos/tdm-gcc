@@ -255,6 +255,33 @@
   ""
   "* return tdm_output_cond_step (\"sub\", operands);")
 
+;; A comparison as a value, 0 or 1: 0, then a predicated add of 1
+;; (tdm_expand_cstore).  32-bit == and != are left to the generic
+;; expansion, which compares the XOR of the words with 0.
+
+(define_expand "cstorehi4"
+  [(set (match_operand:HI 0 "register_operand")
+	(match_operator:HI 1 "ordered_comparison_operator"
+	  [(match_operand:HI 2 "general_operand")
+	   (match_operand:HI 3 "general_operand")]))]
+  ""
+{
+  tdm_expand_cstore (HImode, operands);
+  DONE;
+})
+
+(define_expand "cstoresi4"
+  [(set (match_operand:HI 0 "register_operand")
+	(match_operator:HI 1 "ordered_comparison_operator"
+	  [(match_operand:SI 2 "general_operand")
+	   (match_operand:SI 3 "general_operand")]))]
+  ""
+{
+  if (!tdm_expand_cstore (SImode, operands))
+    FAIL;
+  DONE;
+})
+
 ;; Shifts by a constant are rotates and a mask; other shifts are
 ;; library calls.
 
