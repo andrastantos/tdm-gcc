@@ -2944,6 +2944,86 @@ tdm_expand_si_shift (enum rtx_code code, rtx *operands)
   return true;
 }
 
+/* Make the comparison CODE of *A and *B one that a predicate
+   instruction has, with *A in a register: unsigned > and <= become >=
+   and < with the constant one higher, or with the operands swapped.  */
+
+static void
+tdm_canonicalize_compare (enum rtx_code *code, rtx *a, rtx *b)
+{
+  if (*code == GTU || *code == LEU)
+    {
+      if (CONST_INT_P (*b) && (UINTVAL (*b) & 0xffff) != 0xffff)
+	{
+	  *b = gen_int_mode (INTVAL (*b) + 1, HImode);
+	  *code = *code == GTU ? GEU : LTU;
+	}
+      else
+	{
+	  std::swap (*a, *b);
+	  *code = swap_condition (*code);
+	}
+    }
+  *a = force_reg (HImode, *a);
+  if (CONST_INT_P (*b) && !IN_RANGE (INTVAL (*b), -32, 31))
+    *b = force_reg (HImode, *b);
+}
+
+/* Add 1 to the register D if A CODE B (16-bit) holds.  */
+
+static void
+tdm_emit_cond_inc (rtx d, enum rtx_code code, rtx a, rtx b)
+{
+  tdm_canonicalize_compare (&code, &a, &b);
+  emit_insn (gen_tdm_cond_addhi (d, d, a, b,
+				 gen_rtx_fmt_ee (code, HImode, a, b)));
+}
+
+/* A comparison of MODE operands as a value (cstore OPERANDS): 0, plus 1
+   if it holds.  For 32 bits the high words decide unless they are
+   equal; then the low words, unsigned.  Return false for 32-bit == and
+   !=, which the generic expansion does better.  */
+
+bool
+tdm_expand_cstore (machine_mode mode, rtx *operands)
+{
+  enum rtx_code code = GET_CODE (operands[1]);
+  rtx d = gen_reg_rtx (HImode);
+
+  if (mode == SImode && (code == EQ || code == NE))
+    return false;
+  emit_move_insn (d, const0_rtx);
+  if (mode == HImode)
+    tdm_emit_cond_inc (d, code, operands[2], operands[3]);
+  else
+    {
+      rtx alo = operand_subword_force (operands[2], 0, SImode);
+      rtx ahi = operand_subword_force (operands[2], 1, SImode);
+      rtx blo = operand_subword_force (operands[3], 0, SImode);
+      rtx bhi = operand_subword_force (operands[3], 1, SImode);
+      enum rtx_code hi_code, lo_code = unsigned_condition (code);
+      rtx done = gen_label_rtx ();
+
+      /* The high words decide strictly: a < b and a <= b if a.hi < b.hi.  */
+      switch (code)
+	{
+	case LT: case LE: hi_code = LT; break;
+	case GT: case GE: hi_code = GT; break;
+	case LTU: case LEU: hi_code = LTU; break;
+	case GTU: case GEU: hi_code = GTU; break;
+	default: gcc_unreachable ();
+	}
+      ahi = force_reg (HImode, ahi);
+      bhi = force_reg (HImode, bhi);
+      tdm_emit_cond_inc (d, hi_code, ahi, bhi);
+      emit_cmp_and_jump_insns (ahi, bhi, NE, NULL_RTX, HImode, 0, done);
+      tdm_emit_cond_inc (d, lo_code, alo, blo);
+      emit_label (done);
+    }
+  emit_move_insn (operands[0], d);
+  return true;
+}
+
 /* Branch expansion.  The predicate instructions compare a register
    with a second operand; unsigned > and <= are only available with the
    operands swapped.  */
