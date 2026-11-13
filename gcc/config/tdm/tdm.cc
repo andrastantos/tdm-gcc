@@ -561,11 +561,21 @@ tdm_symbolic_text (rtx x, char *buf, size_t len)
 
    Counting for the length does the same.
 
+   - the final restore of $r0 from [$sp] (an access to a far stack
+     slot), if $r0 is clobbered, and its save there if nothing else
+     reads [$sp].
+
    Two insns next to each other that access memory through the same
    byte pointer in $r0 join: the "rol $r0" that ends the first and the
    "ror $r0" that starts the second go, and $r0 stays rotated in
-   between (see tdm_r0_join_p).  The length of each insn then counts one
-   less word.  */
+   between (see tdm_r0_join_p).  So do two that use $r0 for far stack
+   slots: the restore of $r0 from [$sp] that ends the first and its
+   save there that starts the second go.  The length of each insn then
+   counts one less word.  */
+
+/* The kinds of line that end or start the output of an insn and that a
+   join drops.  */
+enum tdm_r0_end { TDM_R0_NONE, TDM_R0_ROT, TDM_R0_SAVE };
 
 /* The insn whose output is in the buffer, and the buffer.  */
 static rtx_insn *tdm_buf_insn;
@@ -648,6 +658,7 @@ static int tdm_count_insn (rtx_insn *, vec<tdm_lit> *);
 /* While tdm_r0_ends counts an insn: its result.  */
 static bool tdm_r0_querying;
 static int tdm_r0_query_head, tdm_r0_query_tail;
+static enum tdm_r0_end tdm_r0_query_head_kind, tdm_r0_query_tail_kind;
 
 /* The insn that the one output last joined (see above).  */
 static rtx_insn *tdm_r0_joined;
@@ -710,12 +721,12 @@ tdm_r0_prev (rtx_insn *insn)
   return NULL;
 }
 
-/* Count INSN, and return whether its output, after the peephole, starts
-   with a "ror $r0" (HEAD) and ends with a "rol $r0" (TAIL) that a join
-   may drop.  */
+/* Count INSN, and return the kind of the line its output starts with
+   (HEAD) and ends with (TAIL), after the peephole, that a join may
+   drop.  */
 
 static void
-tdm_r0_ends (rtx_insn *insn, bool *head, bool *tail)
+tdm_r0_ends (rtx_insn *insn, enum tdm_r0_end *head, enum tdm_r0_end *tail)
 {
   bool counting = tdm_counting;
   int words = tdm_words;
@@ -728,8 +739,8 @@ tdm_r0_ends (rtx_insn *insn, bool *head, bool *tail)
   tdm_r0_query_head = tdm_r0_query_tail = -1;
   tdm_count_insn (insn, NULL);
   tdm_r0_querying = false;
-  *head = tdm_r0_query_head >= 0;
-  *tail = tdm_r0_query_tail >= 0;
+  *head = tdm_r0_query_head >= 0 ? tdm_r0_query_head_kind : TDM_R0_NONE;
+  *tail = tdm_r0_query_tail >= 0 ? tdm_r0_query_tail_kind : TDM_R0_NONE;
 
   tdm_counting = counting;
   tdm_words = words;
@@ -759,16 +770,21 @@ tdm_r0_join_p (rtx_insn *a, rtx_insn *b)
 }
 
 /* Set *HEAD and *TAIL to the first and the last of the lines in the
-   buffer that stay and mention $r0, if they are a "ror $r0" and a
-   "rol $r0" that a join may drop, or to -1.  */
+   buffer that stay and mention $r0, if they are lines that a join may
+   drop, or to -1, and *HEAD_KIND and *TAIL_KIND to their kinds: a
+   "ror $r0" and a "rol $r0", or a save of $r0 in [$sp] and its restore
+   when no other line before the save or after the restore uses
+   [$sp].  */
 
 static void
-tdm_r0_buf_ends (const vec<bool> &keep, int *head, int *tail)
+tdm_r0_buf_ends (const vec<bool> &keep, int *head, int *tail,
+		 enum tdm_r0_end *head_kind, enum tdm_r0_end *tail_kind)
 {
   unsigned int n = tdm_buf.length ();
   int first = -1, last = -1;
 
   *head = *tail = -1;
+  *head_kind = *tail_kind = TDM_R0_NONE;
   for (unsigned int i = 0; i < n; i++)
     if (tdm_local_jump_p (tdm_buf[i]))
       return;
@@ -791,11 +807,30 @@ tdm_r0_buf_ends (const vec<bool> &keep, int *head, int *tail)
 	  return startswith (tdm_buf[j], "if_");
       return false;
     };
-  if (strcmp (tdm_buf[first], "ror\t$r0") == 0 && !conditional (first))
-    *head = first;
-  if (last != first
-      && strcmp (tdm_buf[last], "rol\t$r0") == 0 && !conditional (last))
-    *tail = last;
+  /* Whether a line that stays from FROM up to TO mentions [$sp].  */
+  auto sp_used = [&] (int from, int to)
+    {
+      for (int j = from; j < to; j++)
+	if (keep[j] && tdm_mentions_p (tdm_buf[j], "[$sp]"))
+	  return true;
+      return false;
+    };
+  if (!conditional (first))
+    {
+      if (strcmp (tdm_buf[first], "ror\t$r0") == 0)
+	*head = first, *head_kind = TDM_R0_ROT;
+      else if (strcmp (tdm_buf[first], "mov\t[$sp], $r0") == 0
+	       && !sp_used (0, first))
+	*head = first, *head_kind = TDM_R0_SAVE;
+    }
+  if (last != first && !conditional (last))
+    {
+      if (strcmp (tdm_buf[last], "rol\t$r0") == 0)
+	*tail = last, *tail_kind = TDM_R0_ROT;
+      else if (strcmp (tdm_buf[last], "mov\t$r0, [$sp]") == 0
+	       && !sp_used (last + 1, n))
+	*tail = last, *tail_kind = TDM_R0_SAVE;
+    }
 }
 
 /* Set KEEP[I] for the lines in the buffer that stay (see above).  */
@@ -849,6 +884,25 @@ tdm_scratch_peephole (vec<bool> &keep)
 	    {
 	      if (strcmp (LINE (i), "rol\t$r0") == 0 && !CONDITIONAL (i))
 		DROP (i);
+	      /* The restore after a far stack slot, and the save before
+		 if nothing else uses [$sp].  */
+	      else if (strcmp (LINE (i), "mov\t$r0, [$sp]") == 0
+		       && !CONDITIONAL (i))
+		{
+		  int save = -1, uses = 0;
+		  for (int j = 0; j < m; j++)
+		    if (tdm_mentions_p (LINE (j), "[$sp]"))
+		      {
+			uses++;
+			if (save < 0 && j < i
+			    && strcmp (LINE (j), "mov\t[$sp], $r0") == 0
+			    && !CONDITIONAL (j))
+			  save = j;
+		      }
+		  DROP (i);
+		  if (save >= 0 && uses == 2)
+		    DROP (save);
+		}
 	      break;
 	    }
       if (changed || !tdm_buf_r1_free)
@@ -938,16 +992,19 @@ tdm_buf_finish (void)
   tdm_scratch_peephole (keep);
 
   int head, tail;
-  tdm_r0_buf_ends (keep, &head, &tail);
+  enum tdm_r0_end head_kind, tail_kind;
+  tdm_r0_buf_ends (keep, &head, &tail, &head_kind, &tail_kind);
   if (tdm_r0_querying)
     {
       tdm_r0_query_head = head;
       tdm_r0_query_tail = tail;
+      tdm_r0_query_head_kind = head_kind;
+      tdm_r0_query_tail_kind = tail_kind;
     }
   else
     {
       rtx_insn *insn = tdm_buf_insn;
-      bool head_ok, tail_ok;
+      enum tdm_r0_end head_ok, tail_ok;
 
       /* The insn before INSN has joined it.  */
       bool joined;
@@ -958,7 +1015,7 @@ tdm_buf_finish (void)
 	  if (prev && tdm_r0_join_p (prev, insn))
 	    {
 	      tdm_r0_ends (prev, &head_ok, &tail_ok);
-	      joined = tail_ok;
+	      joined = tail_ok == head_kind;
 	    }
 	}
       else
@@ -975,7 +1032,7 @@ tdm_buf_finish (void)
       if (next && tdm_r0_join_p (insn, next))
 	{
 	  tdm_r0_ends (next, &head_ok, &tail_ok);
-	  joins = head_ok;
+	  joins = head_ok == tail_kind;
 	}
       if (joins)
 	keep[tail] = false;
