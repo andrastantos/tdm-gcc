@@ -1,8 +1,8 @@
 /* Functions that save several callee-saved registers call libgcc's
    __tdm_save_N in the prologue and jump to __tdm_restore_N in the
    epilogue, except when $r1 holds part of the return value.  One that
-   saves two registers (one: a and the address of id) stores them
-   inline and restores them out of line.  */
+   saves two registers (a and b) stores them inline and restores them
+   out of line.  */
 /* { dg-do compile } */
 /* { dg-skip-if "values stay on the stack" { *-*-* } { "-O0" } { "" } } */
 /* { dg-options "-Os" } */
@@ -24,10 +24,10 @@ many_long (int x)
 }
 
 int
-one (int x)
+two (int x)
 {
-  int a = id (x);
-  return id (a + 1) + a;
+  int a = id (x), b = id (a + 1);
+  return id (a + b) + a + b;
 }
 
 /* { dg-final { scan-assembler-times "\\.word\t__tdm_save_\[0-9\]+" 2 } } */

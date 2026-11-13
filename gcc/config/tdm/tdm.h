@@ -77,6 +77,10 @@
 #define SLOW_BYTE_ACCESS 1
 #define MOVE_MAX 2
 #define MAX_REGS_PER_ADDRESS 1
+/* Calling through a register is no smaller than calling a symbol, and
+   keeping the address in a callee-saved register costs its save and
+   restore.  */
+#define NO_FUNCTION_CSE 1
 #define LOAD_EXTEND_OP(MEM) ZERO_EXTEND
 
 /* Objects, including char objects, are word aligned (an ABI rule).  */

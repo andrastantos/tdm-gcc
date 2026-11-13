@@ -2454,6 +2454,8 @@ tdm_reorg (void)
   auto_vec<tdm_lit> lits;
   auto_vec<tdm_pool_use> uses;
   auto_vec<tdm_pool_site> sites;
+  /* The number of SITES before each of USES.  */
+  auto_vec<int> use_sites;
   auto_vec<tdm_pool> &pools = tdm_pools;
   tdm_pool_builder b (&pools);
   int n[3] = {}, nasm = 0, seg = 0, pooled = 0, reverted = 0, rejoined = 0;
@@ -2509,6 +2511,7 @@ tdm_reorg (void)
 			     tdm_pool_saving (l.kind) };
 	  snprintf (u.text, sizeof u.text, "%s", l.text);
 	  uses.safe_push (u);
+	  use_sites.safe_push (sites.length ());
 	  shrink += u.save;
 	}
     }
@@ -2517,14 +2520,25 @@ tdm_reorg (void)
 	     n[LIT_CONST], n[LIT_JUMP], n[LIT_CBRANCH], nasm);
 
   /* Pools after barriers.  Each use takes the nearest entry with its
-     value in reach, else a new entry in the nearest pool in reach.  */
-  for (tdm_pool_use &u : uses)
+     value in reach, else a new entry in the nearest pool in reach.  The
+     pools placed so far make the code after them longer: BEFORE[I] is
+     the words of those at the sites before site I.  */
+  auto_vec<int> pool_site, before;
+  for (unsigned int ui = 0; ui < uses.length (); ui++)
     {
+      tdm_pool_use &u = uses[ui];
+      before.truncate (0);
+      before.safe_push (0);
+      for (const tdm_pool_site &s : sites)
+	before.safe_push (before.last () + (s.pool < 0 ? 0
+					    : pools[s.pool].size));
+      int uaddr = u.addr + before[use_sites[ui]];
       int best_ent = -1, best_dist = INT_MAX;
       for (int e = b.lookup (u.text); e >= 0; e = b.m_ents[e].prev)
 	{
 	  const tdm_pool &p = pools[b.m_ents[e].pool];
-	  int off = p.addr + b.m_ents[e].pos - u.addr;
+	  int off = (p.addr + before[pool_site[b.m_ents[e].pool]]
+		     + b.m_ents[e].pos - uaddr);
 	  if (p.seg == u.seg
 	      && off >= -32 + TDM_BARRIER_POOL_MARGIN
 	      && off <= 31 - TDM_BARRIER_POOL_MARGIN
@@ -2542,10 +2556,11 @@ tdm_reorg (void)
 	}
 
       tdm_pool_site *best = NULL;
-      for (tdm_pool_site &s : sites)
+      for (unsigned int si = 0; si < sites.length (); si++)
 	{
+	  tdm_pool_site &s = sites[si];
 	  int size = s.pool < 0 ? 0 : pools[s.pool].size;
-	  int off = s.addr + size - u.addr;
+	  int off = s.addr + before[si] + size - uaddr;
 
 	  if (s.seg == u.seg
 	      && off >= -32 + TDM_BARRIER_POOL_MARGIN
@@ -2559,8 +2574,11 @@ tdm_reorg (void)
       if (!best)
 	continue;
       if (best->pool < 0)
-	best->pool = b.add_pool (best->barrier, true, false, best->addr,
-				 best->seg);
+	{
+	  best->pool = b.add_pool (best->barrier, true, false, best->addr,
+				   best->seg);
+	  pool_site.safe_push (best - sites.address ());
+	}
       b.new_entry (&u, best->pool);
       pooled++;
     }
@@ -4080,6 +4098,246 @@ tdm_use_by_pieces_infrastructure_p (unsigned HOST_WIDE_INT size,
   return octets <= 1 && words + 7 * octets <= 12;
 }
 
+/* Costs.  Everything counts words of code, also when optimizing for
+   speed: an instruction takes about the same time whatever it does,
+   and smaller wins (see tdm_use_by_pieces_infrastructure_p).  A
+   COSTS_N_INSNS (1) is one word.  */
+
+/* The words of the 16-bit constant V as a second operand: none for an
+   immediate or one of the constant registers, else a literal.  */
+
+static int
+tdm_const_words (HOST_WIDE_INT v)
+{
+  v = tdm_sext16 (v);
+  return IN_RANGE (v, -32, 31) || tdm_const_reg_text (v) ? 0 : 1;
+}
+
+/* The words of constant V in MODE: each 16-bit half of it.  */
+
+static int
+tdm_const_int_words (HOST_WIDE_INT v, machine_mode mode)
+{
+  int n = GET_MODE_SIZE (mode) > UNITS_PER_WORD
+	  ? GET_MODE_SIZE (mode) / UNITS_PER_WORD : 1;
+  int words = 0;
+  for (int i = 0; i < n; i++, v >>= 16)
+    words += tdm_const_words (v);
+  return words;
+}
+
+/* Whether address X is based on the stack or frame pointer (or is a
+   small absolute address): an operand like a register.  Otherwise it is
+   a byte pointer that has to be in $r0, rotated for the access.  */
+
+static bool
+tdm_frame_address_p (rtx x)
+{
+  if (GET_CODE (x) == PLUS && CONST_INT_P (XEXP (x, 1)))
+    x = XEXP (x, 0);
+  if (CONST_INT_P (x))
+    return true;
+  if (!REG_P (x))
+    return false;
+  unsigned int regno = REGNO (x);
+  return (regno == SP_REGNUM || regno == AP_REGNUM || regno == FP_REGNUM
+	  || VIRTUAL_REGISTER_NUM_P (regno)
+	  || (regno == HARD_FRAME_POINTER_REGNUM && frame_pointer_needed));
+}
+
+/* The extra words of an access to MEM, of MODE: the rotates of $r0
+   around a word access through a pointer, a byte helper call for an
+   octet.  */
+
+static int
+tdm_mem_words (rtx mem, machine_mode mode)
+{
+  if (tdm_frame_address_p (XEXP (mem, 0)))
+    return 0;
+  if (mode == QImode)
+    return 3;
+  int n = GET_MODE_SIZE (mode) > UNITS_PER_WORD
+	  ? GET_MODE_SIZE (mode) / UNITS_PER_WORD : 1;
+  return 2 * n;
+}
+
+/* The words of a shift of a 16-bit value by constant N: rotates, the
+   mask, and for an arithmetic right shift the sign fix-up (see
+   tdm_output_shift).  */
+
+static int
+tdm_hi_shift_words (enum rtx_code code, int n)
+{
+  n &= 15;
+  if (n == 0)
+    return 0;
+  bool left = code == ASHIFT;
+  int words = (n <= 8 ? n : 16 - n) + 1;
+  words += tdm_const_words (left ? (0xffff << n) & 0xffff : 0xffff >> n);
+  if (code == ASHIFTRT)
+    words += 2 + 2 * tdm_const_words (0x8000 >> n);
+  return words;
+}
+
+/* A library call with its arguments set up: about this many words.  */
+#define TDM_LIBCALL_WORDS 5
+
+static bool
+tdm_rtx_costs (rtx x, machine_mode mode, int outer_code, int,
+	       int *total, bool speed)
+{
+  enum rtx_code code = GET_CODE (x);
+  int words = GET_MODE_SIZE (mode) > UNITS_PER_WORD
+	      ? GET_MODE_SIZE (mode) / UNITS_PER_WORD : 1;
+  bool si = words == 2;
+
+  switch (code)
+    {
+    case CONST_INT:
+      *total = COSTS_N_INSNS (tdm_const_int_words (INTVAL (x), mode));
+      return true;
+
+    case SYMBOL_REF:
+    case LABEL_REF:
+    case CONST:
+      /* A literal.  */
+      *total = COSTS_N_INSNS (1);
+      return true;
+
+    case CONST_DOUBLE:
+      *total = COSTS_N_INSNS (words);
+      return true;
+
+    case MEM:
+      *total = COSTS_N_INSNS (tdm_mem_words (x, mode));
+      return true;
+
+    case SET:
+      {
+	rtx dest = SET_DEST (x), src = SET_SRC (x);
+	*total = rtx_cost (src, mode, SET, 1, speed);
+	if (MEM_P (dest))
+	  *total += COSTS_N_INSNS (tdm_mem_words (dest, mode));
+	/* A move is an instruction per word.  */
+	if (REG_P (src) || SUBREG_P (src) || MEM_P (src) || CONSTANT_P (src))
+	  *total += COSTS_N_INSNS (words);
+	return true;
+      }
+
+    case PLUS:
+    case MINUS:
+      /* 32 bits: the words and a predicated carry.  */
+      *total = COSTS_N_INSNS (si ? 4 : words);
+      return false;
+
+    case NEG:
+      *total = COSTS_N_INSNS (si ? 4 : words);
+      return false;
+
+    case AND:
+    case IOR:
+    case XOR:
+    case NOT:
+      *total = COSTS_N_INSNS (words);
+      return false;
+
+    case ASHIFT:
+    case LSHIFTRT:
+    case ASHIFTRT:
+      if (!CONST_INT_P (XEXP (x, 1)))
+	*total = COSTS_N_INSNS (TDM_LIBCALL_WORDS);
+      else if (words == 1)
+	*total = COSTS_N_INSNS (tdm_hi_shift_words (code,
+						    INTVAL (XEXP (x, 1))));
+      else if (si && IN_RANGE (INTVAL (XEXP (x, 1)), 1, 31))
+	{
+	  int k = code == ASHIFT ? 0 : code == LSHIFTRT ? 1 : 2;
+	  /* The table counts a function: its return and moves.  */
+	  int n = tdm_si_shift_words[k][INTVAL (XEXP (x, 1)) - 1];
+	  *total = COSTS_N_INSNS (MAX (MIN (n, 13 + tdm_si_shift_margin) - 2,
+				       1));
+	}
+      else
+	*total = COSTS_N_INSNS (TDM_LIBCALL_WORDS);
+      *total += rtx_cost (XEXP (x, 0), mode, code, 0, speed);
+      return true;
+
+    case ROTATE:
+    case ROTATERT:
+      if (CONST_INT_P (XEXP (x, 1)) && words == 1)
+	{
+	  int n = INTVAL (XEXP (x, 1)) & 15;
+	  *total = COSTS_N_INSNS (MIN (n, 16 - n));
+	}
+      else
+	*total = COSTS_N_INSNS (TDM_LIBCALL_WORDS);
+      *total += rtx_cost (XEXP (x, 0), mode, code, 0, speed);
+      return true;
+
+    case MULT:
+      /* A library call.  By a constant, that is what shifts and adds
+	 have to beat.  Otherwise keep the default cost, which also
+	 counts the time of the loop: libgcc's own (__mulsi3: if (y & 1)
+	 r += x) mustn't look cheaper as a multiplication by (y & 1),
+	 which would call itself.  */
+      if (CONST_INT_P (XEXP (x, 1)))
+	{
+	  *total = COSTS_N_INSNS (TDM_LIBCALL_WORDS + words);
+	  *total += rtx_cost (XEXP (x, 0), mode, code, 0, speed);
+	  return true;
+	}
+      return false;
+
+    /* Division keeps the default costs.  */
+
+    case ZERO_EXTEND:
+      if (MEM_P (XEXP (x, 0)))
+	{
+	  /* Loading an octet clears the high one.  */
+	  *total = rtx_cost (XEXP (x, 0), GET_MODE (XEXP (x, 0)),
+			     code, 0, speed);
+	  return true;
+	}
+      *total = COSTS_N_INSNS (1);
+      return false;
+
+    case SIGN_EXTEND:
+      /* Through the zero extension, then (x ^ m) - m.  */
+      *total = COSTS_N_INSNS (GET_MODE (XEXP (x, 0)) == QImode ? 4 : 3);
+      return false;
+
+    case IF_THEN_ELSE:
+      /* A predicate and a jump.  */
+      *total = COSTS_N_INSNS (1);
+      return false;
+
+    case EQ: case NE: case LT: case LE: case GT: case GE:
+    case LTU: case LEU: case GTU: case GEU:
+      if (outer_code == IF_THEN_ELSE)
+	*total = COSTS_N_INSNS (1);
+      else
+	/* 0, the predicate and an add of 1.  */
+	*total = COSTS_N_INSNS (3);
+      if (GET_MODE_SIZE (GET_MODE (XEXP (x, 0))) > UNITS_PER_WORD)
+	*total += COSTS_N_INSNS (3);
+      return false;
+
+    default:
+      return false;
+    }
+}
+
+/* Addresses through the stack pointer cost nothing; through a pointer,
+   a word for the rotates of $r0 around the access.  (1 and 2 words
+   measured the same; GCC's default, the rtx cost of the address, was a
+   little worse.)  */
+
+static int
+tdm_address_cost (rtx x, machine_mode, addr_space_t, bool)
+{
+  return tdm_frame_address_p (x) ? 0 : COSTS_N_INSNS (1);
+}
+
 /* Miscellaneous.  */
 
 static void
@@ -4177,6 +4435,11 @@ tdm_init_libfuncs (void)
 #define TARGET_CONSTANT_ALIGNMENT tdm_constant_alignment
 #undef  TARGET_VECTOR_ALIGNMENT
 #define TARGET_VECTOR_ALIGNMENT tdm_vector_alignment
+
+#undef  TARGET_RTX_COSTS
+#define TARGET_RTX_COSTS tdm_rtx_costs
+#undef  TARGET_ADDRESS_COST
+#define TARGET_ADDRESS_COST tdm_address_cost
 
 #undef  TARGET_USE_BY_PIECES_INFRASTRUCTURE_P
 #define TARGET_USE_BY_PIECES_INFRASTRUCTURE_P \
