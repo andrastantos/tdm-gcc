@@ -2864,6 +2864,8 @@ tdm_reorg (void)
    high word (tdm_cond_addhi, tdm_cond_subhi).  The words go through
    new registers, so that operands may overlap.  */
 
+static bool tdm_frame_address_p (rtx);
+
 void
 tdm_expand_si_arith (enum rtx_code code, rtx *operands)
 {
@@ -2885,28 +2887,48 @@ tdm_expand_si_arith (enum rtx_code code, rtx *operands)
       rtx lo2 = operand_subword_force (operands[2], 0, SImode);
       rtx hi2 = operand_subword_force (operands[2], 1, SImode);
       bool carry = lo2 != const0_rtx;
-      /* The operand compared with: a register, or a small constant.  */
+      /* The operand compared with: a register, a stack slot read again,
+	 or a small constant.  */
+      auto ok = [] (rtx x)
+	{
+	  return (REG_P (x) || SUBREG_P (x)
+		  || (MEM_P (x) && !MEM_VOLATILE_P (x)
+		      && tdm_frame_address_p (XEXP (x, 0)))
+		  || (CONST_INT_P (x) && IN_RANGE (INTVAL (x), -32, 31)));
+	};
       rtx b = lo2;
       if (code == MINUS)
-	lo1 = force_reg (HImode, lo1);
-      else if (MEM_P (b) || (CONST_INT_P (b) && !IN_RANGE (INTVAL (b), -32, 31)))
-	b = REG_P (lo1) ? lo1 : force_reg (HImode, lo2);
-      if (code == MINUS && CONST_INT_P (b) && !IN_RANGE (INTVAL (b), -32, 31))
-	b = force_reg (HImode, b);
-
-      v = expand_simple_binop (HImode, code, lo1, b == lo1 ? lo2 : b, lo, 0,
-			       OPTAB_LIB_WIDEN);
-      emit_move_insn (lo, v);
-      v = expand_simple_binop (HImode, code, hi1, hi2, hi, 0, OPTAB_LIB_WIDEN);
-      emit_move_insn (hi, v);
-      if (carry && code == PLUS)
-	/* lo = lo1 + lo2 carries iff lo < lo2 (and lo < lo1).  */
-	emit_insn (gen_tdm_cond_addhi (hi, hi, lo, b,
-				       gen_rtx_LTU (HImode, lo, b)));
-      else if (carry)
-	/* lo1 - lo2 borrows iff lo1 < lo2.  */
-	emit_insn (gen_tdm_cond_subhi (hi, hi, lo1, b,
-				       gen_rtx_LTU (HImode, lo1, b)));
+	{
+	  /* lo1 - lo2 borrows iff lo1 < lo2: do the high word and the
+	     borrow first, so that lo1 isn't needed after the low word.  */
+	  lo1 = force_reg (HImode, lo1);
+	  if (!ok (b))
+	    b = force_reg (HImode, b);
+	  v = expand_simple_binop (HImode, MINUS, hi1, hi2, hi, 0,
+				   OPTAB_LIB_WIDEN);
+	  emit_move_insn (hi, v);
+	  if (carry)
+	    emit_insn (gen_tdm_cond_subhi (hi, hi, lo1, b,
+					   gen_rtx_LTU (HImode, lo1, b)));
+	  v = expand_simple_binop (HImode, MINUS, lo1, b, lo, 0,
+				   OPTAB_LIB_WIDEN);
+	  emit_move_insn (lo, v);
+	}
+      else
+	{
+	  if (!ok (b))
+	    b = ok (lo1) ? lo1 : force_reg (HImode, lo2);
+	  v = expand_simple_binop (HImode, PLUS, lo1, b == lo1 ? lo2 : b, lo,
+				   0, OPTAB_LIB_WIDEN);
+	  emit_move_insn (lo, v);
+	  v = expand_simple_binop (HImode, PLUS, hi1, hi2, hi, 0,
+				   OPTAB_LIB_WIDEN);
+	  emit_move_insn (hi, v);
+	  if (carry)
+	    /* lo = lo1 + lo2 carries iff lo < lo2 (and lo < lo1).  */
+	    emit_insn (gen_tdm_cond_addhi (hi, hi, lo, b,
+					   gen_rtx_LTU (HImode, lo, b)));
+	}
     }
   emit_move_insn (operand_subword (operands[0], 0, 1, SImode), lo);
   emit_move_insn (operand_subword (operands[0], 1, 1, SImode), hi);
