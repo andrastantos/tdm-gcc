@@ -3267,6 +3267,34 @@ tdm_expand_cstore (machine_mode mode, rtx *operands)
   return true;
 }
 
+/* == or != of MODE operands as a value (cstore OPERANDS): the OR of the
+   XORs of their words compared with 0.  */
+
+void
+tdm_expand_cstore_eq (machine_mode mode, rtx *operands)
+{
+  int n = GET_MODE_SIZE (mode) / UNITS_PER_WORD;
+  rtx acc = NULL_RTX;
+
+  for (int i = 0; i < n; i++)
+    {
+      rtx a = operand_subword_force (operands[2], i, mode);
+      rtx b = operand_subword_force (operands[3], i, mode);
+      rtx w = (b == const0_rtx ? a
+	       : expand_simple_binop (HImode, XOR, a, b, NULL_RTX, 1,
+				      OPTAB_LIB_WIDEN));
+      acc = (acc ? expand_simple_binop (HImode, IOR, acc, w, NULL_RTX, 1,
+					OPTAB_LIB_WIDEN)
+	     : w);
+    }
+  acc = force_reg (HImode, acc);
+  rtx ops[4] = { operands[0],
+		 gen_rtx_fmt_ee (GET_CODE (operands[1]), HImode, acc,
+				 const0_rtx),
+		 acc, const0_rtx };
+  tdm_expand_cstore (HImode, ops);
+}
+
 /* Branch expansion.  The predicate instructions compare a register
    with a second operand; unsigned > and <= are only available with the
    operands swapped.  */
