@@ -571,7 +571,12 @@ tdm_symbolic_text (rtx x, char *buf, size_t len)
    between (see tdm_r0_join_p).  So do two that use $r0 for far stack
    slots: the restore of $r0 from [$sp] that ends the first and its
    save there that starts the second go.  The length of each insn then
-   counts one less word.  */
+   counts one less word.
+
+   And when the output of an insn ends with a move between $r1 and a
+   memory register or stack slot, a move between the same two that
+   starts the output of the next insn changes nothing, and goes (see
+   tdm_r1_move_p).  */
 
 /* The kinds of line that end or start the output of an insn and that a
    join drops.  */
@@ -659,6 +664,12 @@ static int tdm_count_insn (rtx_insn *, vec<tdm_lit> *);
 static bool tdm_r0_querying;
 static int tdm_r0_query_head, tdm_r0_query_tail;
 static enum tdm_r0_end tdm_r0_query_head_kind, tdm_r0_query_tail_kind;
+/* The first and the last line of the insn counted that may go or make
+   the first line of the next one go (see tdm_r1_move_p), or empty.  */
+static char tdm_r0_query_first[TDM_LIT_LEN], tdm_r0_query_last[TDM_LIT_LEN];
+
+/* The insn whose first line goes (see tdm_r1_move_p).  */
+static rtx_insn *tdm_r1_dropped;
 
 /* The insn that the one output last joined (see above).  */
 static rtx_insn *tdm_r0_joined;
@@ -726,7 +737,8 @@ tdm_r0_prev (rtx_insn *insn)
    drop.  */
 
 static void
-tdm_r0_ends (rtx_insn *insn, enum tdm_r0_end *head, enum tdm_r0_end *tail)
+tdm_r0_ends (rtx_insn *insn, enum tdm_r0_end *head, enum tdm_r0_end *tail,
+	     char *first = NULL, char *last = NULL)
 {
   bool counting = tdm_counting;
   int words = tdm_words;
@@ -741,6 +753,10 @@ tdm_r0_ends (rtx_insn *insn, enum tdm_r0_end *head, enum tdm_r0_end *tail)
   tdm_r0_querying = false;
   *head = tdm_r0_query_head >= 0 ? tdm_r0_query_head_kind : TDM_R0_NONE;
   *tail = tdm_r0_query_tail >= 0 ? tdm_r0_query_tail_kind : TDM_R0_NONE;
+  if (first)
+    strcpy (first, tdm_r0_query_first);
+  if (last)
+    strcpy (last, tdm_r0_query_last);
 
   tdm_counting = counting;
   tdm_words = words;
@@ -749,6 +765,67 @@ tdm_r0_ends (rtx_insn *insn, enum tdm_r0_end *head, enum tdm_r0_end *tail)
   tdm_lit_index = lit_index;
   /* The operands of INSN are in recog_data now.  */
   recog_data.insn = NULL;
+}
+
+/* The place that LINE moves $r1 to or from, if it is a memory register
+   or a stack slot, else NULL.  */
+
+static const char *
+tdm_r1_move_place (const char *line)
+{
+  const char *x;
+  if (startswith (line, "mov\t$r1, "))
+    x = line + strlen ("mov\t$r1, ");
+  else if (startswith (line, "mov\t") && strlen (line) > 9
+	   && strcmp (line + strlen (line) - 5, ", $r1") == 0)
+    {
+      static char buf[TDM_LIT_LEN];
+      size_t n = strlen (line) - strlen ("mov\t") - 5;
+      if (n >= sizeof buf)
+	return NULL;
+      memcpy (buf, line + strlen ("mov\t"), n);
+      buf[n] = 0;
+      x = buf;
+    }
+  else
+    return NULL;
+  if (startswith (x, "$mr"))
+    {
+      for (const char *p = x + 3; *p; p++)
+	if (!ISDIGIT (*p))
+	  return NULL;
+      return x;
+    }
+  if (strcmp (x, "[$sp]") == 0)
+    return x;
+  if (startswith (x, "[$sp+") || startswith (x, "[$sp-"))
+    {
+      const char *p = x + 5;
+      if (!ISDIGIT (*p))
+	return NULL;
+      while (ISDIGIT (*p))
+	p++;
+      return strcmp (p, "]") == 0 ? x : NULL;
+    }
+  return NULL;
+}
+
+/* Whether FIRST, the line that starts the output of an insn, changes
+   nothing after LAST, the line that ends the output of the one before:
+   both move between $r1 and the same memory register or stack slot.  */
+
+static bool
+tdm_r1_move_p (const char *last, const char *first)
+{
+  if (!*last || !*first)
+    return false;
+  const char *x = tdm_r1_move_place (last);
+  if (!x)
+    return false;
+  char a[TDM_LIT_LEN];
+  snprintf (a, sizeof a, "%s", x);
+  x = tdm_r1_move_place (first);
+  return x && strcmp (a, x) == 0;
 }
 
 /* Whether A and B, whose output follows that of A, join.  A source
@@ -994,12 +1071,44 @@ tdm_buf_finish (void)
   int head, tail;
   enum tdm_r0_end head_kind, tail_kind;
   tdm_r0_buf_ends (keep, &head, &tail, &head_kind, &tail_kind);
+
+  /* The first and the last line that stay, for tdm_r1_move_p: not
+     lines that a join of $r0 may drop, nor when the output jumps within
+     itself, nor a conditional last line.  */
+  char first_line[TDM_LIT_LEN] = "", last_line[TDM_LIT_LEN] = "";
+  int first = -1, last = -1;
+  bool jumps = false;
+  for (unsigned int i = 0; i < n; i++)
+    {
+      jumps |= tdm_local_jump_p (tdm_buf[i]);
+      if (keep[i])
+	{
+	  if (first < 0)
+	    first = i;
+	  last = i;
+	}
+    }
+  if (!jumps && first >= 0)
+    {
+      if (first != head && strlen (tdm_buf[first]) < TDM_LIT_LEN)
+	strcpy (first_line, tdm_buf[first]);
+      int before = -1;
+      for (int j = last - 1; j >= 0 && before < 0; j--)
+	if (keep[j])
+	  before = j;
+      if (last != tail && strlen (tdm_buf[last]) < TDM_LIT_LEN
+	  && !(before >= 0 && startswith (tdm_buf[before], "if_")))
+	strcpy (last_line, tdm_buf[last]);
+    }
+
   if (tdm_r0_querying)
     {
       tdm_r0_query_head = head;
       tdm_r0_query_tail = tail;
       tdm_r0_query_head_kind = head_kind;
       tdm_r0_query_tail_kind = tail_kind;
+      strcpy (tdm_r0_query_first, first_line);
+      strcpy (tdm_r0_query_last, last_line);
     }
   else
     {
@@ -1038,6 +1147,43 @@ tdm_buf_finish (void)
 	keep[tail] = false;
       if (!tdm_counting)
 	tdm_r0_joined = joins ? next : NULL;
+
+      /* The first line goes after the last one of the insn before.  */
+      bool dropped;
+      if (tdm_counting)
+	{
+	  rtx_insn *prev = (tdm_r1_move_place (first_line)
+			    ? tdm_r0_prev (insn) : NULL);
+	  char prev_last[TDM_LIT_LEN];
+	  dropped = false;
+	  if (prev)
+	    {
+	      tdm_r0_ends (prev, &head_ok, &tail_ok, NULL, prev_last);
+	      dropped = tdm_r1_move_p (prev_last, first_line);
+	    }
+	}
+      else
+	dropped = tdm_r1_dropped == insn;
+      if (dropped)
+	{
+	  gcc_checking_assert (first >= 0 && *first_line);
+	  keep[first] = false;
+	}
+
+      /* The first line of the next insn goes.  */
+      if (!tdm_counting)
+	{
+	  rtx_insn *next1 = (tdm_r1_move_place (last_line)
+			     ? tdm_r0_next (insn) : NULL);
+	  char next_first[TDM_LIT_LEN];
+	  tdm_r1_dropped = NULL;
+	  if (next1)
+	    {
+	      tdm_r0_ends (next1, &head_ok, &tail_ok, next_first, NULL);
+	      if (tdm_r1_move_p (last_line, next_first))
+		tdm_r1_dropped = next1;
+	    }
+	}
     }
 
   for (unsigned int i = 0; i < n; i++)
