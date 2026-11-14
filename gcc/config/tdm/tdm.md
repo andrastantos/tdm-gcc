@@ -144,6 +144,32 @@
   ""
   "tdm_fix_operand_pairs (operands, 2);")
 
+;; The byte address of a stack slot near $sp, in $r0: "mov $r0, $sp+N;
+;; add $r0, $r0" and for a high octet "add $r0, 1", instead of a copy of
+;; $sp (two words) and the addition of the offset.  Only made after
+;; register allocation, by the peephole below: as an alternative of
+;; *addhi3 it has reload ask for $r0 when it isn't to be had.
+(define_insn "*stack_addr"
+  [(set (match_operand:HI 0 "register_operand" "=z")
+	(plus:HI (match_operand:HI 1 "register_operand" "k")
+		 (match_operand:HI 2 "const_int_operand" "J")))]
+  "reload_completed
+   && REGNO (operands[0]) == R0_REGNUM
+   && REGNO (operands[1]) == SP_REGNUM
+   && satisfies_constraint_J (operands[2])"
+  "* return tdm_output_binop (\"add\", operands);")
+
+(define_peephole2
+  [(set (match_operand:HI 0 "register_operand")
+	(match_operand:HI 1 "register_operand"))
+   (set (match_dup 0)
+	(plus:HI (match_dup 0)
+		 (match_operand:HI 2 "const_int_operand")))]
+  "REGNO (operands[0]) == R0_REGNUM
+   && REGNO (operands[1]) == SP_REGNUM
+   && satisfies_constraint_J (operands[2])"
+  [(set (match_dup 0) (plus:HI (match_dup 1) (match_dup 2)))])
+
 (define_insn "*addhi3"
   [(set (match_operand:HI 0 "nonimmediate_operand" "=r,m,Q,k,k")
 	(plus:HI (match_operand:HI 1 "nonimmediate_operand" "%0,0,0,0,0")

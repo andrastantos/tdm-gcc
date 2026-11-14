@@ -1856,7 +1856,23 @@ tdm_output_binop (const char *op, rtx *operands)
   tdm_loc d = tdm_classify (operands[0]);
   tdm_loc s = tdm_classify (operands[2]);
 
-  if (d.kind == LOC_SP && CONST_INT_P (operands[2]))
+  if (d.kind == LOC_R0 && REG_P (operands[1])
+      && REGNO (operands[1]) == STACK_POINTER_REGNUM)
+    {
+      /* The byte address of a stack slot: twice its word address, and
+	 one more for its high octet.  */
+      HOST_WIDE_INT off = INTVAL (operands[2]);
+      HOST_WIDE_INT words = off >> 1;
+      gcc_assert (strcmp (op, "add") == 0 && IN_RANGE (words, -32, 31));
+      if (words)
+	tdm_emit ("mov\t$r0, $sp%+d", (int) words);
+      else
+	tdm_emit ("mov\t$r0, $sp");
+      tdm_emit ("add\t$r0, $r0");
+      if (off & 1)
+	tdm_emit ("add\t$r0, 1");
+    }
+  else if (d.kind == LOC_SP && CONST_INT_P (operands[2]))
     {
       /* Adjust the stack pointer, in words.  */
       HOST_WIDE_INT words = INTVAL (operands[2]) / 2;

@@ -25,6 +25,9 @@
 (define_register_constraint "t" "R1_REGS"
   "$r1.")
 
+(define_register_constraint "z" "R0_REGS"
+  "$r0.")
+
 (define_register_constraint "j" "NOR0_REGS"
   "Any register but $r0: for asm operands, see tdm_md_asm_adjust.")
 
@@ -35,6 +38,12 @@
   "A signed 6-bit immediate."
   (and (match_code "const_int")
        (match_test "IN_RANGE (ival, -32, 31)")))
+
+;; "mov $r0, $sp+N" takes a signed 6-bit count of words.
+(define_constraint "J"
+  "An octet offset from the stack pointer within 32 words."
+  (and (match_code "const_int")
+       (match_test "IN_RANGE (ival, -64, 63)")))
 
 (define_special_memory_constraint "Q"
   "A memory operand that is not addressed through $r0."
