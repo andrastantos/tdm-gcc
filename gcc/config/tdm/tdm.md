@@ -270,6 +270,20 @@
   DONE;
 })
 
+;; 64-bit == and != reduce to one word: the OR of the XORs of the
+;; words.  (The generic expansion only does that for two words; for
+;; four, != shifts -x | x right by 63.)
+(define_expand "cstoredi4"
+  [(set (match_operand:HI 0 "register_operand")
+	(match_operator:HI 1 "equality_operator"
+	  [(match_operand:DI 2 "general_operand")
+	   (match_operand:DI 3 "general_operand")]))]
+  ""
+{
+  tdm_expand_cstore_eq (DImode, operands);
+  DONE;
+})
+
 (define_expand "cstoresi4"
   [(set (match_operand:HI 0 "register_operand")
 	(match_operator:HI 1 "ordered_comparison_operator"

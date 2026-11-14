@@ -22,6 +22,9 @@
 (define_predicate "tdm_cbranch_operator"
   (match_code "eq,ne,ltu,geu,lt,ge,le,gt"))
 
+(define_predicate "equality_operator"
+  (match_code "eq,ne"))
+
 (define_predicate "call_address_operand"
   (ior (match_code "symbol_ref")
        (match_operand 0 "register_operand")))

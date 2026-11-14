@@ -23,6 +23,7 @@ extern void tdm_expand_cbranch (rtx *);
 extern void tdm_expand_si_arith (enum rtx_code, rtx *);
 extern bool tdm_expand_si_shift (enum rtx_code, rtx *);
 extern bool tdm_expand_cstore (machine_mode, rtx *);
+extern void tdm_expand_cstore_eq (machine_mode, rtx *);
 extern const char *tdm_output_cond_step (const char *, rtx *);
 extern bool tdm_q_memory_p (rtx);
 extern bool tdm_operand_pair_ok_p (rtx, rtx);
