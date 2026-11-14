@@ -553,6 +553,10 @@ tdm_symbolic_text (rtx x, char *buf, size_t len)
    buffer, and tdm_scratch_peephole drops what isn't needed:
 
    - "rol $r0; ror $r0" (or the other way round), which changes nothing;
+   - a swap twice in a row, which changes nothing either, and a move or
+     a swap after a move between the same two;
+   - "swap R, X; mov R, X" becomes "mov X, R", and "swap R, X; mov X, R"
+     "mov R, X";
    - the final "rol $r0", if $r0 is clobbered;
    - a save of $r1 in [$sp-1] and its restore, if $r1 is clobbered;
    - "swap $r1, X ... swap $r1, X" becomes "mov $r1, X ... mov X, $r1"
@@ -573,10 +577,13 @@ tdm_symbolic_text (rtx x, char *buf, size_t len)
    save there that starts the second go.  The length of each insn then
    counts one less word.
 
-   And when the output of an insn ends with a move between $r1 and a
-   memory register or stack slot, a move between the same two that
+   And when the output of an insn ends with a move between $r0 or $r1
+   and a memory register or stack slot, a move between the same two that
    starts the output of the next insn changes nothing, and goes (see
-   tdm_r1_move_p).  */
+   tdm_r1_move_p), and so does a swap of them.  After a swap of the two
+   on the same source line a move goes as well, and the swap becomes the
+   move the other way; the same swap again goes together with the first
+   one.  */
 
 /* The kinds of line that end or start the output of an insn and that a
    join drops.  */
@@ -767,28 +774,54 @@ tdm_r0_ends (rtx_insn *insn, enum tdm_r0_end *head, enum tdm_r0_end *tail,
   recog_data.insn = NULL;
 }
 
-/* The place that LINE moves $r1 to or from, if it is a memory register
-   or a stack slot, else NULL.  */
+/* The place that LINE moves $r0 or $r1 to or from, or swaps it with,
+   if it is a memory register or a stack slot, else NULL.  Set *REG to
+   the register's digit, *SWAP to whether LINE is a swap and *LOAD to
+   whether it is a move to the register.  */
 
 static const char *
-tdm_r1_move_place (const char *line)
+tdm_r1_move_place (const char *line, char *reg = NULL, bool *swap = NULL,
+		   bool *load = NULL)
 {
+  static char buf[TDM_LIT_LEN];
   const char *x;
-  if (startswith (line, "mov\t$r1, "))
-    x = line + strlen ("mov\t$r1, ");
-  else if (startswith (line, "mov\t") && strlen (line) > 9
-	   && strcmp (line + strlen (line) - 5, ", $r1") == 0)
+  size_t len = strlen (line);
+  char r;
+  bool is_swap = false, is_load = false;
+
+  if (startswith (line, "mov\t$r0, ") || startswith (line, "mov\t$r1, "))
     {
-      static char buf[TDM_LIT_LEN];
-      size_t n = strlen (line) - strlen ("mov\t") - 5;
+      is_load = true;
+      r = line[6];
+      x = line + strlen ("mov\t$r1, ");
+    }
+  else if (startswith (line, "swap\t$r0, ")
+	   || startswith (line, "swap\t$r1, "))
+    {
+      is_swap = true;
+      r = line[7];
+      x = line + strlen ("swap\t$r1, ");
+    }
+  else if (startswith (line, "mov\t") && len > 9
+	   && (strcmp (line + len - 5, ", $r1") == 0
+	       || strcmp (line + len - 5, ", $r0") == 0))
+    {
+      size_t n = len - strlen ("mov\t") - 5;
       if (n >= sizeof buf)
 	return NULL;
       memcpy (buf, line + strlen ("mov\t"), n);
       buf[n] = 0;
       x = buf;
+      r = line[len - 1];
     }
   else
     return NULL;
+  if (reg)
+    *reg = r;
+  if (swap)
+    *swap = is_swap;
+  if (load)
+    *load = is_load;
   if (startswith (x, "$mr"))
     {
       for (const char *p = x + 3; *p; p++)
@@ -810,22 +843,53 @@ tdm_r1_move_place (const char *line)
   return NULL;
 }
 
-/* Whether FIRST, the line that starts the output of an insn, changes
-   nothing after LAST, the line that ends the output of the one before:
-   both move between $r1 and the same memory register or stack slot.  */
+/* Whether FIRST, the line that starts the output of an insn, goes after
+   LAST, the line that ends the output of the one before.  Both are
+   between the same register, $r0 or $r1, and the same memory register
+   or stack slot.  After a move, FIRST (a move or a swap) changes
+   nothing.  After a swap, only if SAME_LINE (the insns are on the same
+   source line: in between, the register isn't what it was): the same
+   swap goes together with LAST (*DROP_LAST is set), and a move goes if
+   LAST becomes the move the other way, which is put in REPLACEMENT.  */
 
 static bool
-tdm_r1_move_p (const char *last, const char *first)
+tdm_r1_move_p (const char *last, const char *first, bool same_line,
+	       char *replacement = NULL, bool *drop_last = NULL)
 {
+  char reg_a, reg_b;
+  bool swap_a, swap_b, load_b;
+
+  if (replacement)
+    *replacement = 0;
+  if (drop_last)
+    *drop_last = false;
   if (!*last || !*first)
     return false;
-  const char *x = tdm_r1_move_place (last);
+  const char *x = tdm_r1_move_place (last, &reg_a, &swap_a);
   if (!x)
     return false;
   char a[TDM_LIT_LEN];
   snprintf (a, sizeof a, "%s", x);
-  x = tdm_r1_move_place (first);
-  return x && strcmp (a, x) == 0;
+  x = tdm_r1_move_place (first, &reg_b, &swap_b, &load_b);
+  if (!x || strcmp (a, x) != 0 || reg_a != reg_b)
+    return false;
+  if (!swap_a)
+    return true;
+  if (!same_line)
+    return false;
+  if (swap_b)
+    {
+      if (drop_last)
+	*drop_last = true;
+    }
+  else if (replacement)
+    {
+      if (load_b)
+	snprintf (replacement, TDM_LIT_LEN, "mov\t%.40s, $r%c", a, reg_a);
+      else
+	snprintf (replacement, TDM_LIT_LEN, "mov\t$r%c, %.40s", reg_a, a);
+    }
+  return true;
 }
 
 /* Whether A and B, whose output follows that of A, join.  A source
@@ -952,6 +1016,51 @@ tdm_scratch_peephole (vec<bool> &keep)
 	    DROP (i);
 	    DROP (i + 1);
 	  }
+      if (changed)
+	continue;
+
+      for (int i = 0; i + 1 < m && !changed; i++)
+	{
+	  const char *a = LINE (i), *b = LINE (i + 1);
+	  if (CONDITIONAL (i))
+	    continue;
+	  /* A move or a swap after a move between the same two.  */
+	  if (!startswith (a, "swap") && tdm_r1_move_p (a, b, false))
+	    {
+	      DROP (i + 1);
+	      continue;
+	    }
+	  if (!(startswith (a, "swap\t$r0, ") || startswith (a, "swap\t$r1, ")))
+	    continue;
+	  /* The same swap twice.  */
+	  if (strcmp (a, b) == 0)
+	    {
+	      DROP (i);
+	      DROP (i + 1);
+	      continue;
+	    }
+	  /* A swap of R and X, then a move between them.  */
+	  char r[4] = { a[5], a[6], a[7], 0 };
+	  const char *x = a + strlen ("swap\t$r1, ");
+	  size_t nb = strlen (b), nx = strlen (x);
+	  if (tdm_mentions_p (x, r))
+	    continue;
+	  char *line = NULL;
+	  if (startswith (b, "mov\t") && strncmp (b + 4, r, 3) == 0
+	      && b[7] == ',' && b[8] == ' ' && strcmp (b + 9, x) == 0)
+	    line = xasprintf ("mov\t%s, %s", x, r);
+	  else if (startswith (b, "mov\t") && nb == 4 + nx + 5
+		   && strncmp (b + 4, x, nx) == 0
+		   && b[4 + nx] == ',' && b[5 + nx] == ' '
+		   && strcmp (b + 6 + nx, r) == 0)
+	    line = xasprintf ("mov\t%s, %s", r, x);
+	  if (line)
+	    {
+	      free (LINE (i + 1));
+	      LINE (i + 1) = line;
+	      DROP (i);
+	    }
+	}
       if (changed)
 	continue;
 
@@ -1088,7 +1197,10 @@ tdm_buf_finish (void)
 	  last = i;
 	}
     }
-  if (!jumps && first >= 0)
+  /* A swap that is the only line takes no part: it can't go both as a
+     first and as a last line.  */
+  if (!jumps && first >= 0
+      && !(first == last && startswith (tdm_buf[first], "swap")))
     {
       if (first != head && strlen (tdm_buf[first]) < TDM_LIT_LEN)
 	strcpy (first_line, tdm_buf[first]);
@@ -1159,7 +1271,8 @@ tdm_buf_finish (void)
 	  if (prev)
 	    {
 	      tdm_r0_ends (prev, &head_ok, &tail_ok, NULL, prev_last);
-	      dropped = tdm_r1_move_p (prev_last, first_line);
+	      dropped = tdm_r1_move_p (prev_last, first_line,
+				       tdm_r0_join_p (prev, insn));
 	    }
 	}
       else
@@ -1170,18 +1283,31 @@ tdm_buf_finish (void)
 	  keep[first] = false;
 	}
 
-      /* The first line of the next insn goes.  */
+      /* The first line of the next insn goes, and the last line of this
+	 one with it or changed (see tdm_r1_move_p).  Counting only needs
+	 to know of a last line that goes: a swap.  */
+      bool last_swap = false;
+      rtx_insn *next1 = (tdm_r1_move_place (last_line, NULL, &last_swap)
+			 ? tdm_r0_next (insn) : NULL);
       if (!tdm_counting)
+	tdm_r1_dropped = NULL;
+      if (next1 && (!tdm_counting || last_swap))
 	{
-	  rtx_insn *next1 = (tdm_r1_move_place (last_line)
-			     ? tdm_r0_next (insn) : NULL);
-	  char next_first[TDM_LIT_LEN];
-	  tdm_r1_dropped = NULL;
-	  if (next1)
+	  char next_first[TDM_LIT_LEN], repl[TDM_LIT_LEN];
+	  bool drop_last;
+	  tdm_r0_ends (next1, &head_ok, &tail_ok, next_first, NULL);
+	  if (tdm_r1_move_p (last_line, next_first,
+			     tdm_r0_join_p (insn, next1), repl, &drop_last))
 	    {
-	      tdm_r0_ends (next1, &head_ok, &tail_ok, next_first, NULL);
-	      if (tdm_r1_move_p (last_line, next_first))
+	      if (!tdm_counting)
 		tdm_r1_dropped = next1;
+	      if (drop_last)
+		keep[last] = false;
+	      else if (*repl && !tdm_counting)
+		{
+		  free (tdm_buf[last]);
+		  tdm_buf[last] = xstrdup (repl);
+		}
 	    }
 	}
     }
