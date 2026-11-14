@@ -674,6 +674,9 @@ static enum tdm_r0_end tdm_r0_query_head_kind, tdm_r0_query_tail_kind;
 /* The first and the last line of the insn counted that may go or make
    the first line of the next one go (see tdm_r1_move_p), or empty.  */
 static char tdm_r0_query_first[TDM_LIT_LEN], tdm_r0_query_last[TDM_LIT_LEN];
+/* Whether the insn counted overwrites $r1 before it reads it (bit 0),
+   and whether it does after its first line (bit 1).  */
+static int tdm_r0_query_r1_dead;
 
 /* The insn whose first line goes (see tdm_r1_move_p).  */
 static rtx_insn *tdm_r1_dropped;
@@ -745,7 +748,7 @@ tdm_r0_prev (rtx_insn *insn)
 
 static void
 tdm_r0_ends (rtx_insn *insn, enum tdm_r0_end *head, enum tdm_r0_end *tail,
-	     char *first = NULL, char *last = NULL)
+	     char *first = NULL, char *last = NULL, int *r1_dead = NULL)
 {
   bool counting = tdm_counting;
   int words = tdm_words;
@@ -756,6 +759,7 @@ tdm_r0_ends (rtx_insn *insn, enum tdm_r0_end *head, enum tdm_r0_end *tail,
   gcc_checking_assert (!tdm_r0_querying);
   tdm_r0_querying = true;
   tdm_r0_query_head = tdm_r0_query_tail = -1;
+  tdm_r0_query_r1_dead = 0;
   tdm_count_insn (insn, NULL);
   tdm_r0_querying = false;
   *head = tdm_r0_query_head >= 0 ? tdm_r0_query_head_kind : TDM_R0_NONE;
@@ -764,6 +768,8 @@ tdm_r0_ends (rtx_insn *insn, enum tdm_r0_end *head, enum tdm_r0_end *tail,
     strcpy (first, tdm_r0_query_first);
   if (last)
     strcpy (last, tdm_r0_query_last);
+  if (r1_dead)
+    *r1_dead = tdm_r0_query_r1_dead;
 
   tdm_counting = counting;
   tdm_words = words;
@@ -847,7 +853,8 @@ tdm_r1_move_place (const char *line, char *reg = NULL, bool *swap = NULL,
    LAST, the line that ends the output of the one before.  Both are
    between the same register, $r0 or $r1, and the same memory register
    or stack slot.  After a move, FIRST (a move or a swap) changes
-   nothing.  After a swap, only if SAME_LINE (the insns are on the same
+   nothing; when not optimizing it only goes if SAME_LINE.  After a
+   swap, only if SAME_LINE (the insns are on the same
    source line: in between, the register isn't what it was): the same
    swap goes together with LAST (*DROP_LAST is set), and a move goes if
    LAST becomes the move the other way, which is put in REPLACEMENT.  */
@@ -873,8 +880,11 @@ tdm_r1_move_p (const char *last, const char *first, bool same_line,
   x = tdm_r1_move_place (first, &reg_b, &swap_b, &load_b);
   if (!x || strcmp (a, x) != 0 || reg_a != reg_b)
     return false;
+  /* Without optimization, leave each source line its instructions: a
+     breakpoint on a line whose only instruction went would be on the
+     next line.  */
   if (!swap_a)
-    return true;
+    return same_line || optimize;
   if (!same_line)
     return false;
   if (swap_b)
@@ -974,6 +984,27 @@ tdm_r0_buf_ends (const vec<bool> &keep, int *head, int *tail,
     }
 }
 
+/* Whether the lines in the buffer that stay, from FROM on, overwrite
+   $r1 before any of them reads it or may jump.  */
+
+static bool
+tdm_r1_dead_from_p (const vec<bool> &keep, unsigned int from)
+{
+  for (unsigned int i = from; i < tdm_buf.length (); i++)
+    {
+      const char *l = tdm_buf[i];
+      if (!keep[i])
+	continue;
+      if (startswith (l, "if_") || strstr (l, "$pc") || l[0] == '.')
+	return false;
+      if (startswith (l, "mov\t$r1, "))
+	return !tdm_mentions_p (l + strlen ("mov\t$r1, "), "$r1");
+      if (tdm_mentions_p (l, "$r1"))
+	return false;
+    }
+  return false;
+}
+
 /* Set KEEP[I] for the lines in the buffer that stay (see above).  */
 
 static void
@@ -1025,7 +1056,7 @@ tdm_scratch_peephole (vec<bool> &keep)
 	  if (CONDITIONAL (i))
 	    continue;
 	  /* A move or a swap after a move between the same two.  */
-	  if (!startswith (a, "swap") && tdm_r1_move_p (a, b, false))
+	  if (!startswith (a, "swap") && tdm_r1_move_p (a, b, true))
 	    {
 	      DROP (i + 1);
 	      continue;
@@ -1090,6 +1121,27 @@ tdm_scratch_peephole (vec<bool> &keep)
 		    DROP (save);
 		}
 	      break;
+	    }
+      if (changed)
+	continue;
+
+      /* A load of $r1 that a later line overwrites, with none that reads
+	 it or is a predicate in between.  */
+      for (int i = 0; i + 1 < m && !changed; i++)
+	if (startswith (LINE (i), "mov\t$r1, ") && !CONDITIONAL (i))
+	  for (int j = i + 1; j < m; j++)
+	    {
+	      const char *b = LINE (j);
+	      if (startswith (b, "if_") || strstr (b, "$pc") || b[0] == '.')
+		break;
+	      if (startswith (b, "mov\t$r1, "))
+		{
+		  if (!tdm_mentions_p (b + strlen ("mov\t$r1, "), "$r1"))
+		    DROP (i);
+		  break;
+		}
+	      if (tdm_mentions_p (b, "$r1"))
+		break;
 	    }
       if (changed || !tdm_buf_r1_free)
 	continue;
@@ -1221,6 +1273,16 @@ tdm_buf_finish (void)
       tdm_r0_query_tail_kind = tail_kind;
       strcpy (tdm_r0_query_first, first_line);
       strcpy (tdm_r0_query_last, last_line);
+      if (!jumps && first >= 0)
+	{
+	  bool swap, load;
+	  char reg;
+	  tdm_r0_query_r1_dead = tdm_r1_dead_from_p (keep, first);
+	  if (tdm_r1_move_place (tdm_buf[first], &reg, &swap, &load)
+	      && reg == '1' && !swap && !load
+	      && tdm_r1_dead_from_p (keep, first + 1))
+	    tdm_r0_query_r1_dead |= 2;
+	}
     }
   else
     {
@@ -1309,6 +1371,29 @@ tdm_buf_finish (void)
 		  tdm_buf[last] = xstrdup (repl);
 		}
 	    }
+	}
+    }
+
+  /* A load of $r1 from a memory register or a stack slot that ends the
+     output goes if the next insn, on the same source line, overwrites
+     $r1 before it reads it; so does a restore of $r1 that the next insn
+     saves again in the same place (a save that goes, see above).  */
+  if (!tdm_r0_querying && *last_line && keep[last]
+      && startswith (last_line, "mov\t$r1, ")
+      && tdm_r1_move_place (last_line))
+    {
+      rtx_insn *insn = tdm_buf_insn;
+      rtx_insn *next2 = tdm_r0_next (insn);
+      if (next2 && tdm_r0_join_p (insn, next2))
+	{
+	  enum tdm_r0_end h, t;
+	  char next_first[TDM_LIT_LEN];
+	  int dead;
+	  tdm_r0_ends (next2, &h, &t, next_first, NULL, &dead);
+	  if (tdm_r1_move_p (last_line, next_first, true)
+	      ? ((dead & 2) && !startswith (next_first, "mov\t$r1, "))
+	      : (dead & 1))
+	    keep[last] = false;
 	}
     }
 
@@ -2711,8 +2796,9 @@ tdm_r0_base_p (rtx_insn *insn)
 
 /* Emit a clobber of $r1 after each insn where it is dead and that
    doesn't use it, and of $r0 after each insn where it is dead and that
-   accesses memory through it (see "Scratch registers").  Not after
-   jumps and calls, whose output doesn't make use of it.  */
+   accesses memory through it or doesn't use it: an access to a far
+   stack slot needs it (see "Scratch registers").  Not after jumps and
+   calls, whose output doesn't make use of it.  */
 
 static unsigned int
 tdm_mark_scratch (void)
@@ -2740,7 +2826,8 @@ tdm_mark_scratch (void)
 		emit_insn_after (gen_rtx_CLOBBER (VOIDmode, r1), insn);
 	      if (!bitmap_bit_p (live, R0_REGNUM)
 		  && !reg_set_p (r0, insn)
-		  && tdm_r0_base_p (insn))
+		  && (tdm_r0_base_p (insn)
+		      || !reg_mentioned_p (r0, PATTERN (insn))))
 		emit_insn_after (gen_rtx_CLOBBER (VOIDmode, r0), insn);
 	    }
 	  df_simulate_one_insn_backwards (bb, insn, live);
