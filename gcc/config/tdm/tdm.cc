@@ -596,6 +596,28 @@ static auto_vec<char *> tdm_buf;
 /* Whether $r0 and $r1 are clobbered after the insn in the buffer.  */
 static bool tdm_buf_r0_free, tdm_buf_r1_free;
 
+/* How an insn finds $r0 when it starts: unknown; holding the address
+   of a word of the frame if the insn before joins it, that is drops its
+   restore of $r0 for this one's save (TDM_FAR_JOIN); or holding it in
+   any case, the insn before having had no need to restore a dead $r0
+   (TDM_FAR_LEFT).  */
+enum tdm_far_kind { TDM_FAR_NONE, TDM_FAR_JOIN, TDM_FAR_LEFT };
+
+/* Far stack slots (see tdm_far_begin) of the insn in the buffer.  How
+   it finds $r0, and the offset from $sp of the word $r0 points to;
+   whether it leaves $r0 pointing into the frame before it restores it,
+   and where; the line after those that load $r0; and the line that
+   saves $r0 if the insn relies on a join, or -1.  */
+static enum tdm_far_kind tdm_buf_far_in_kind;
+static bool tdm_buf_far_out_p;
+static HOST_WIDE_INT tdm_buf_far_in, tdm_buf_far_out;
+static int tdm_buf_far_set, tdm_buf_far_rel;
+
+/* For final: the insn output next, and how it finds $r0 (as above).  */
+static rtx_insn *tdm_far_next_insn;
+static enum tdm_far_kind tdm_far_next_kind;
+static HOST_WIDE_INT tdm_far_next;
+
 /* Whether the output of INSN goes to the buffer.  */
 
 static bool
@@ -628,10 +650,17 @@ tdm_clobbered_after_p (rtx_insn *insn, unsigned int regno)
 /* Start buffering the output of INSN.  */
 
 static void
-tdm_buf_start (rtx_insn *insn)
+tdm_buf_start (rtx_insn *insn, enum tdm_far_kind far_in_kind = TDM_FAR_NONE,
+	       HOST_WIDE_INT far_in = 0)
 {
   gcc_checking_assert (tdm_buf.is_empty ());
   tdm_buf_insn = insn;
+  tdm_buf_far_in_kind = far_in_kind;
+  tdm_buf_far_in = far_in;
+  tdm_buf_far_out_p = false;
+  tdm_buf_far_out = 0;
+  tdm_buf_far_set = 0;
+  tdm_buf_far_rel = -1;
   tdm_buf_r0_free = tdm_clobbered_after_p (insn, R0_REGNUM);
   tdm_buf_r1_free = tdm_clobbered_after_p (insn, R1_REGNUM);
 }
@@ -677,6 +706,10 @@ static char tdm_r0_query_first[TDM_LIT_LEN], tdm_r0_query_last[TDM_LIT_LEN];
 /* Whether the insn counted overwrites $r1 before it reads it (bit 0),
    and whether it does after its first line (bit 1).  */
 static int tdm_r0_query_r1_dead;
+/* Where the insn counted leaves $r0 before it restores it (see
+   tdm_buf_far_out_p), and whether it doesn't restore it.  */
+static bool tdm_r0_query_far_p, tdm_r0_query_far_left;
+static HOST_WIDE_INT tdm_r0_query_far;
 
 /* The insn whose first line goes (see tdm_r1_move_p).  */
 static rtx_insn *tdm_r1_dropped;
@@ -748,20 +781,27 @@ tdm_r0_prev (rtx_insn *insn)
 
 static void
 tdm_r0_ends (rtx_insn *insn, enum tdm_r0_end *head, enum tdm_r0_end *tail,
-	     char *first = NULL, char *last = NULL, int *r1_dead = NULL)
+	     char *first = NULL, char *last = NULL, int *r1_dead = NULL,
+	     bool *far_p = NULL, HOST_WIDE_INT *far = NULL,
+	     bool *far_left = NULL)
 {
   bool counting = tdm_counting;
   int words = tdm_words;
   vec<tdm_lit> *lits = tdm_lits;
   rtx_insn *lit_insn = tdm_lit_insn;
   int lit_index = tdm_lit_index;
+  bool querying = tdm_r0_querying;
 
-  gcc_checking_assert (!tdm_r0_querying);
+  /* Counting INSN may ask about the insn before it in turn (see
+     tdm_far_in), but only before its own output starts, and the result
+     of a query is set when it ends.  */
   tdm_r0_querying = true;
   tdm_r0_query_head = tdm_r0_query_tail = -1;
   tdm_r0_query_r1_dead = 0;
+  tdm_r0_query_far_p = tdm_r0_query_far_left = false;
+  tdm_r0_query_first[0] = tdm_r0_query_last[0] = 0;
   tdm_count_insn (insn, NULL);
-  tdm_r0_querying = false;
+  tdm_r0_querying = querying;
   *head = tdm_r0_query_head >= 0 ? tdm_r0_query_head_kind : TDM_R0_NONE;
   *tail = tdm_r0_query_tail >= 0 ? tdm_r0_query_tail_kind : TDM_R0_NONE;
   if (first)
@@ -770,6 +810,12 @@ tdm_r0_ends (rtx_insn *insn, enum tdm_r0_end *head, enum tdm_r0_end *tail,
     strcpy (last, tdm_r0_query_last);
   if (r1_dead)
     *r1_dead = tdm_r0_query_r1_dead;
+  if (far_p)
+    *far_p = tdm_r0_query_far_p;
+  if (far)
+    *far = tdm_r0_query_far;
+  if (far_left)
+    *far_left = tdm_r0_query_far_left;
 
   tdm_counting = counting;
   tdm_words = words;
@@ -778,6 +824,30 @@ tdm_r0_ends (rtx_insn *insn, enum tdm_r0_end *head, enum tdm_r0_end *tail,
   tdm_lit_index = lit_index;
   /* The operands of INSN are in recog_data now.  */
   recog_data.insn = NULL;
+}
+
+static bool tdm_r0_join_p (rtx_insn *, rtx_insn *);
+static bool tdm_far_insn_p (rtx_insn *);
+
+/* How INSN, with a far stack slot, finds $r0 when it starts, after the
+   insn before it; set *BASE to the offset from $sp of the word $r0
+   points to.  A join takes both on the same source line.  */
+
+static enum tdm_far_kind
+tdm_far_in (rtx_insn *insn, HOST_WIDE_INT *base)
+{
+  rtx_insn *prev = tdm_r0_prev (insn);
+  enum tdm_r0_end head, tail;
+  bool far_p, far_left;
+
+  if (!prev || !tdm_far_insn_p (prev) || !tdm_far_insn_p (insn))
+    return TDM_FAR_NONE;
+  tdm_r0_ends (prev, &head, &tail, NULL, NULL, NULL, &far_p, base, &far_left);
+  if (far_left)
+    return TDM_FAR_LEFT;
+  if (tail == TDM_R0_SAVE && far_p && tdm_r0_join_p (prev, insn))
+    return TDM_FAR_JOIN;
+  return TDM_FAR_NONE;
 }
 
 /* The place that LINE moves $r0 or $r1 to or from, or swaps it with,
@@ -1232,6 +1302,27 @@ tdm_buf_finish (void)
   int head, tail;
   enum tdm_r0_end head_kind, tail_kind;
   tdm_r0_buf_ends (keep, &head, &tail, &head_kind, &tail_kind);
+  /* Whether the insn leaves $r0 pointing into the frame: no line that
+     stays after those that loaded it changes it.  */
+  bool far_left = tdm_buf_far_out_p;
+  for (unsigned int i = tdm_buf_far_set; i < n && far_left; i++)
+    if (keep[i])
+      {
+	const char *l = tdm_buf[i], *p = strchr (l, '\t');
+	if (tdm_local_jump_p (l) || strstr (l, "$pc")
+	    || (p && startswith (p + 1, "$r0")))
+	  far_left = false;
+      }
+
+  /* An insn that addresses its far slot from where the insn before left
+     $r0 joins that one, whatever became of its save of $r0.  */
+  if (tdm_buf_far_rel >= 0)
+    {
+      head = tdm_buf_far_rel;
+      head_kind = TDM_R0_SAVE;
+      if (tail == head)
+	tail = -1, tail_kind = TDM_R0_NONE;
+    }
 
   /* The first and the last line that stay, for tdm_r1_move_p: not
      lines that a join of $r0 may drop, nor when the output jumps within
@@ -1273,6 +1364,10 @@ tdm_buf_finish (void)
       tdm_r0_query_tail_kind = tail_kind;
       strcpy (tdm_r0_query_first, first_line);
       strcpy (tdm_r0_query_last, last_line);
+      tdm_r0_query_far_p = tdm_buf_far_out_p;
+      tdm_r0_query_far = tdm_buf_far_out;
+      tdm_r0_query_far_left = far_left;
+      tdm_r0_query_r1_dead = 0;
       if (!jumps && first >= 0)
 	{
 	  bool swap, load;
@@ -1306,6 +1401,9 @@ tdm_buf_finish (void)
 	  joined = tdm_r0_joined == insn;
 	  gcc_checking_assert (!joined || head >= 0);
 	}
+      /* An insn that addresses its slot from where $r0 was relies on
+	 it.  */
+      gcc_assert (joined || tdm_buf_far_rel < 0);
       if (joined)
 	keep[head] = false;
 
@@ -1320,7 +1418,21 @@ tdm_buf_finish (void)
       if (joins)
 	keep[tail] = false;
       if (!tdm_counting)
-	tdm_r0_joined = joins ? next : NULL;
+	{
+	  tdm_r0_joined = joins ? next : NULL;
+	  tdm_far_next_insn = tdm_r0_next (insn);
+	  tdm_far_next_kind = TDM_FAR_NONE;
+	  tdm_far_next = tdm_buf_far_out;
+	  if (tdm_far_next_insn && tdm_far_insn_p (insn)
+	      && tdm_far_insn_p (tdm_far_next_insn))
+	    {
+	      if (far_left)
+		tdm_far_next_kind = TDM_FAR_LEFT;
+	      else if (tail_kind == TDM_R0_SAVE && tdm_buf_far_out_p
+		       && tdm_r0_join_p (insn, tdm_far_next_insn))
+		tdm_far_next_kind = TDM_FAR_JOIN;
+	    }
+	}
 
       /* The first line goes after the last one of the insn before.  */
       bool dropped;
@@ -1439,7 +1551,13 @@ tdm_buf_sync (void)
     {
       tdm_buf_finish ();
       if (tdm_buffered_insn_p (current_output_insn))
-	tdm_buf_start (current_output_insn);
+	{
+	  tdm_buf_start (current_output_insn,
+			 (tdm_far_next_insn == current_output_insn
+			  ? tdm_far_next_kind : TDM_FAR_NONE),
+			 tdm_far_next);
+	  tdm_far_next_insn = NULL;
+	}
     }
 }
 
@@ -1964,6 +2082,29 @@ tdm_emit_movqi (const tdm_loc &d, const tdm_loc &s)
     tdm_emit_op ("mov", d, s);
 }
 
+/* Whether INSN has a far stack slot as an operand.  */
+
+static bool
+tdm_far_insn_p (rtx_insn *insn)
+{
+  subrtx_iterator::array_type array;
+  FOR_EACH_SUBRTX (iter, array, PATTERN (insn), NONCONST)
+    if (MEM_P (*iter))
+      {
+	rtx addr = XEXP (*iter, 0);
+	if (GET_CODE (addr) == PLUS && REG_P (XEXP (addr, 0))
+	    && REGNO (XEXP (addr, 0)) == STACK_POINTER_REGNUM
+	    && CONST_INT_P (XEXP (addr, 1)))
+	  {
+	    HOST_WIDE_INT first = INTVAL (XEXP (addr, 1));
+	    HOST_WIDE_INT size = GET_MODE_SIZE (GET_MODE (*iter));
+	    if (first >> 1 < -32 || (first + MAX (size, 1) - 1) >> 1 > 31)
+	      return true;
+	  }
+      }
+  return false;
+}
+
 /* Stack slots beyond [$sp+31], and those addressed through the frame
    pointer, are reached through $r0, loaded with their word address.  $r0 itself is kept in [$sp], the free word at
    the bottom of the frame, and operands in $r0 are taken from there;
@@ -1986,6 +2127,17 @@ tdm_far_begin (tdm_loc *d, tdm_loc *s, bool load)
 	      && d->kind != LOC_R0MEM && !(s && s->kind == LOC_R0MEM));
 
   save = !(load && d->kind == LOC_R0);
+  tdm_buf_sync ();
+
+  /* When the insn before has left $r0 within reach of the slot, address
+     it from there, and $r0 stays where it is.  If that takes a join,
+     this insn must save $r0: the save, which is the first line, goes
+     with the join.  */
+  bool rel = (f->kind == LOC_SPMEM
+	      && tdm_buf_insn && tdm_buf.is_empty ()
+	      && (tdm_buf_far_in_kind == TDM_FAR_LEFT
+		  || (tdm_buf_far_in_kind == TDM_FAR_JOIN && save))
+	      && IN_RANGE (f->n - tdm_buf_far_in, -32, 31));
   if (save)
     {
       tdm_emit ("mov\t[$sp], $r0");
@@ -1995,26 +2147,44 @@ tdm_far_begin (tdm_loc *d, tdm_loc *s, bool load)
 	*s = tdm_make_loc (LOC_R0SAVE);
     }
 
-  if (f->kind == LOC_FPMEM)
+  if (rel)
     {
-      n = f->n;
-      tdm_emit ("mov\t$r0, $mr6");
-    }
-  else if (f->n > 0)
-    {
-      n = f->n - 31;
-      tdm_emit ("mov\t$r0, $sp+31");
+      if (tdm_buf_far_in_kind == TDM_FAR_JOIN)
+	tdm_buf_far_rel = 0;
+      tdm_buf_far_set = tdm_buf.length ();
+      n = f->n - tdm_buf_far_in;
+      tdm_buf_far_out_p = true;
+      tdm_buf_far_out = tdm_buf_far_in;
     }
   else
     {
-      /* Below $sp: only out of bounds accesses get there.  */
-      n = f->n + 32;
-      tdm_emit ("mov\t$r0, $sp-32");
-    }
-  if (!IN_RANGE (n, -32, 31))
-    {
-      tdm_emit_to_reg ("add", r0, tdm_make_loc (LOC_IMM, tdm_sext16 (n)));
-      n = 0;
+      if (f->kind == LOC_FPMEM)
+	{
+	  n = f->n;
+	  tdm_emit ("mov\t$r0, $mr6");
+	}
+      else if (f->n > 0)
+	{
+	  n = f->n - 31;
+	  tdm_emit ("mov\t$r0, $sp+31");
+	}
+      else
+	{
+	  /* Below $sp: only out of bounds accesses get there.  */
+	  n = f->n + 32;
+	  tdm_emit ("mov\t$r0, $sp-32");
+	}
+      if (!IN_RANGE (n, -32, 31))
+	{
+	  tdm_emit_to_reg ("add", r0, tdm_make_loc (LOC_IMM, tdm_sext16 (n)));
+	  n = 0;
+	}
+      if (tdm_buf_insn)
+	{
+	  tdm_buf_far_out_p = f->kind == LOC_SPMEM;
+	  tdm_buf_far_out = f->n - n;
+	  tdm_buf_far_set = tdm_buf.length ();
+	}
     }
   f->kind = LOC_R0MEM;
   f->n = n;
@@ -2257,7 +2427,10 @@ class tdm_buf_stash
 {
 public:
   tdm_buf_stash ()
-    : m_insn (tdm_buf_insn), m_r0 (tdm_buf_r0_free), m_r1 (tdm_buf_r1_free)
+    : m_insn (tdm_buf_insn), m_r0 (tdm_buf_r0_free), m_r1 (tdm_buf_r1_free),
+      m_far_in_kind (tdm_buf_far_in_kind), m_far_out_p (tdm_buf_far_out_p),
+      m_far_in (tdm_buf_far_in), m_far_out (tdm_buf_far_out),
+      m_far_set (tdm_buf_far_set), m_far_rel (tdm_buf_far_rel)
   {
     m_buf.safe_splice (tdm_buf);
     tdm_buf.truncate (0);
@@ -2270,11 +2443,21 @@ public:
     tdm_buf_insn = m_insn;
     tdm_buf_r0_free = m_r0;
     tdm_buf_r1_free = m_r1;
+    tdm_buf_far_in_kind = m_far_in_kind;
+    tdm_buf_far_set = m_far_set;
+    tdm_buf_far_out_p = m_far_out_p;
+    tdm_buf_far_in = m_far_in;
+    tdm_buf_far_out = m_far_out;
+    tdm_buf_far_rel = m_far_rel;
   }
 
 private:
   rtx_insn *m_insn;
   bool m_r0, m_r1;
+  enum tdm_far_kind m_far_in_kind;
+  bool m_far_out_p;
+  HOST_WIDE_INT m_far_in, m_far_out;
+  int m_far_set, m_far_rel;
   auto_vec<char *> m_buf;
 };
 
@@ -2509,6 +2692,12 @@ tdm_count_insn (rtx_insn *insn, vec<tdm_lit> *lits)
     return 2;
 
   tdm_buf_stash stash;
+  /* This counts the insn before, so it comes before the operands of
+     INSN are extracted.  */
+  HOST_WIDE_INT far_in = 0;
+  enum tdm_far_kind far_in_kind
+    = (tdm_buffered_insn_p (insn) && tdm_far_insn_p (insn)
+       ? tdm_far_in (insn, &far_in) : TDM_FAR_NONE);
   extract_constrain_insn_cached (insn);
   tdm_counting = true;
   tdm_words = 0;
@@ -2516,7 +2705,7 @@ tdm_count_insn (rtx_insn *insn, vec<tdm_lit> *lits)
   tdm_lit_insn = insn;
   tdm_lit_index = 0;
   if (tdm_buffered_insn_p (insn))
-    tdm_buf_start (insn);
+    tdm_buf_start (insn, far_in_kind, far_in);
   tmpl = get_insn_template (code, insn);
   tdm_buf_finish ();
   tdm_lit_insn = NULL;
