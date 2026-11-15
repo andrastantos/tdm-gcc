@@ -5720,7 +5720,7 @@ expand_builtin_strub_leave (tree exp)
 			   ptr_mode, NULL_RTX, done, NULL,
 			   profile_probability::very_likely ());
 
-  if (optimize < 3)
+  if (optimize < 3 || !TARGET_STRUB_INLINE_LEAVE)
     expand_call (exp, NULL_RTX, true);
   else
     {
