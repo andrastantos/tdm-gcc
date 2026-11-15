@@ -51,6 +51,7 @@
 #include "insn-addr.h"
 #include "tree-pass.h"
 #include "rtl-iter.h"
+#include "cfgbuild.h"
 
 /* This file should be included last.  */
 #include "target-def.h"
@@ -2995,7 +2996,9 @@ tdm_r0_base_p (rtx_insn *insn)
    doesn't use it, and of $r0 after each insn where it is dead and that
    accesses memory through it or doesn't use it: an access to a far
    stack slot needs it (see "Scratch registers").  Not after jumps and
-   calls, whose output doesn't make use of it.  */
+   calls, whose output doesn't make use of it, nor after an insn that
+   may throw (with -fnon-call-exceptions), which has to stay the last
+   one of its basic block.  */
 
 static unsigned int
 tdm_mark_scratch (void)
@@ -3016,7 +3019,9 @@ tdm_mark_scratch (void)
 	{
 	  if (!NONDEBUG_INSN_P (insn))
 	    continue;
-	  if (NONJUMP_INSN_P (insn) && recog_memoized (insn) >= 0)
+	  if (NONJUMP_INSN_P (insn)
+	      && recog_memoized (insn) >= 0
+	      && !control_flow_insn_p (insn))
 	    {
 	      if (!bitmap_bit_p (live, R1_REGNUM)
 		  && !reg_mentioned_p (r1, PATTERN (insn)))
