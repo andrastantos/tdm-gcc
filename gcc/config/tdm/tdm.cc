@@ -2781,6 +2781,14 @@ tdm_output_pool (rtx id, rtx skip)
   return "";
 }
 
+/* What the length attributes take off the reach of a short jump, in
+   octets.  While tdm_reorg places the pools, a jump whose target is
+   only just in reach counts as far and gets a pool entry: a pool put
+   between the two later would otherwise leave it far without one.
+   Those still in reach in the end are made short again.  */
+int tdm_reach_margin;
+#define TDM_REACH_MARGIN 8
+
 /* The word address of INSN, from shorten_branches.  */
 
 static int
@@ -3094,6 +3102,7 @@ tdm_reorg (void)
   tdm_lit_insn = NULL;
 
   /* Find the literals and the places for pools.  */
+  tdm_reach_margin = TDM_REACH_MARGIN;
   shorten_branches (get_insns ());
   for (rtx_insn *insn = get_insns (); insn; insn = NEXT_INSN (insn))
     {
@@ -3385,10 +3394,14 @@ tdm_reorg (void)
 
   /* Check the distances with the pools in place, and put the uses out
      of reach back inline, until all are in reach.  Each round only
-     drops uses, and entries without any.  Then let the inline uses take
-     a live entry with their value in reach: that only makes the code
-     shorter, which leaves the others in reach, but check again.  */
-  hash_set<tdm_lit_key_hash> tried;
+     drops uses, and entries without any.  Then make the jumps and
+     branches short whose target is in reach by now, and let the inline
+     uses take a live entry with their value in reach: both only make
+     the code shorter, which leaves the others in reach, but check
+     again.  */
+  hash_set<tdm_lit_key_hash> tried, shortened;
+  int unpooled = 0;
+  tdm_reach_margin = 0;
   for (bool check = pooled > 0; check; )
     {
       for (bool changed = true; changed; )
@@ -3414,9 +3427,60 @@ tdm_reorg (void)
 	    }
 	}
 
+      /* A jump or branch that loads its target from a pool and reaches
+	 it with a short jump of the same length: the entry may go.  The
+	 addresses are those of the last round, which changed nothing.
+	 Only once for each: one that turns out far after all may take
+	 an entry again below.  */
+      check = false;
+      for (tdm_pool_use &u : uses)
+	{
+	  if (u.ent < 0
+	      || !JUMP_P (u.insn)
+	      || CROSSING_JUMP_P (u.insn)
+	      || (INSN_CODE (u.insn) != CODE_FOR_jump
+		  && INSN_CODE (u.insn) != CODE_FOR_tdm_cbranchhi4))
+	    continue;
+	  bool cbranch = INSN_CODE (u.insn) == CODE_FOR_tdm_cbranchhi4;
+	  lits.truncate (0);
+	  tdm_count_insn (u.insn, &lits);
+	  if (u.index != (int) lits.length () - 1
+	      || lits[u.index].kind != (cbranch ? LIT_CBRANCH : LIT_JUMP))
+	    continue;
+	  rtx label = JUMP_LABEL (u.insn);
+	  if (!label || !LABEL_P (label))
+	    continue;
+	  /* As the length attributes measure it: from the end of the
+	     insn for a jump forwards.  */
+	  int dist = (INSN_ADDRESSES (INSN_UID (label))
+		      - INSN_ADDRESSES (INSN_UID (u.insn)));
+	  if (dist > 0)
+	    dist -= get_attr_length (u.insn);
+	  if (cbranch)
+	    {
+	      /* The second alternative is always long.  */
+	      extract_constrain_insn_cached (u.insn);
+	      if (which_alternative != 0
+		  || !IN_RANGE (dist, CBRANCH_REACH_MIN, CBRANCH_REACH_MAX))
+		continue;
+	    }
+	  else if (!IN_RANGE (dist, JUMP_REACH_MIN, JUMP_REACH_MAX))
+	    continue;
+	  auto key = std::make_pair (INSN_UID (u.insn), u.index);
+	  if (shortened.add (key))
+	    continue;
+	  tdm_pool_ent &x = b.m_ents[u.ent];
+	  if (--x.nuses == 0)
+	    tdm_pool_entries[tdm_pool_start[x.pool] + x.pos].dead = true;
+	  tdm_lit_labels->remove (key);
+	  u.ent = -1;
+	  pooled--;
+	  unpooled++;
+	  check = true;
+	}
+
       /* Every inline literal: one that went back inline, or a branch
 	 that became far.  */
-      check = false;
       seg = 0;
       for (rtx_insn *insn = get_insns (); insn; insn = NEXT_INSN (insn))
 	{
@@ -3473,9 +3537,9 @@ tdm_reorg (void)
 	  fprintf (dump_file, ";; pooled: insn %d literal %d in pool %d: %s\n",
 		   INSN_UID (u.insn), u.index, b.m_ents[u.ent].pool, u.text);
       fprintf (dump_file, ";; pools %d (%d after barriers), entries %d, "
-	       "pooled %d, back inline %d, rejoined %d, inline %d\n",
+	       "pooled %d, back inline %d, rejoined %d, short %d, inline %d\n",
 	       (int) pools.length (), barrier_pools, live, pooled, reverted,
-	       rejoined, (int) uses.length () - pooled);
+	       rejoined, unpooled, (int) uses.length () - pooled - unpooled);
     }
 }
 

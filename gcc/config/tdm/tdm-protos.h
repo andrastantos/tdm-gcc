@@ -33,6 +33,7 @@ extern void tdm_expand_nonlocal_goto (rtx *);
 extern const char *tdm_output_raw_fp (rtx, bool);
 extern bool tdm_regno_ok_for_base_p (unsigned int);
 extern int tdm_insn_length (rtx_insn *);
+extern int tdm_reach_margin;
 extern const char *tdm_output_move (rtx *, machine_mode);
 extern const char *tdm_output_binop (const char *, rtx *);
 extern const char *tdm_output_unop (enum rtx_code, rtx *);
