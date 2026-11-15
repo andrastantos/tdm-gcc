@@ -240,6 +240,10 @@ enum reg_class
    frame from $mr6; dynamic allocations lower $sp further.  */
 
 #define STACK_GROWS_DOWNWARD 1
+
+/* A stack scrubbing loop expanded inline would clear the scratch word
+   [$sp-1] while its own pointer is saved there.  */
+#define TARGET_STRUB_INLINE_LEAVE 0
 #define FRAME_GROWS_DOWNWARD 0
 #define STACK_PUSH_CODE POST_DEC
 #define STACK_POINTER_OFFSET 2

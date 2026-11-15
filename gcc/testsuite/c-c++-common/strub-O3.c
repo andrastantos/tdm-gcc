@@ -10,4 +10,4 @@ int f() {
 
 /* { dg-final { scan-rtl-dump-not "strub_enter" "expand" } } */
 /* { dg-final { scan-rtl-dump-not "strub_update" "expand" } } */
-/* { dg-final { scan-rtl-dump-not "strub_leave" "expand" } } */
+/* { dg-final { scan-rtl-dump-not "strub_leave" "expand" { xfail tdm-*-* } } } */
