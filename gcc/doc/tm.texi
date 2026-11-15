@@ -3557,6 +3557,16 @@ arguments or its return address, and its implementation is trivial
 enough that it doesn't use a stack frame.
 @end defmac
 
+@defmac TARGET_STRUB_INLINE_LEAVE
+If defined to zero, the compiler never expands the scrubbing loop of
+@code{__builtin___strub_leave} inline, and calls @code{__strub_leave}
+instead.  The inline loop clears memory starting right at the stack
+pointer of the function it is expanded in; define this to zero if the
+code generated for that function may be using memory there, such as a
+scratch area beyond the stack pointer that isn't limited to leaf
+functions.  The default is 1.
+@end defmac
+
 @node Exception Handling
 @subsection Exception Handling Support
 @cindex exception handling
