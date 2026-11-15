@@ -37,6 +37,17 @@
    (SP_REGNUM	34)
    (PC_REGNUM	35)])
 
+;; How far a short jump reaches, in octets, as the length attributes
+;; measure it: backwards from the start of the insn to its target,
+;; forwards from the end of the insn.  For a jump, and for a conditional
+;; branch (see tdm_cbranchhi4).  While tdm_reorg places the literal
+;; pools, tdm_reach_margin makes it shorter.
+(define_constants
+  [(JUMP_REACH_MIN -64)
+   (JUMP_REACH_MAX 60)
+   (CBRANCH_REACH_MIN -60)
+   (CBRANCH_REACH_MAX 60)])
+
 (define_c_enum "unspec"
   [UNSPEC_RAW_FP])
 
@@ -391,7 +402,11 @@
 ;; is none.  It is always a long branch.
 ;;
 ;; The length attribute is the predicate and a short jump (4) or a skip
-;; over a long jump (8).  ADJUST_INSN_LENGTH adds what goes before the
+;; over a long jump (8).  The short jump is the last word, and the
+;; second or (when the first alternative stores $r1 in the scratch
+;; word first) the third; it reaches from 32 words before itself to 31
+;; after.  A branch backwards is measured from the start of the insn,
+;; one forwards from its end: the bounds hold in every case.  ADJUST_INSN_LENGTH adds what goes before the
 ;; predicate (tdm_cbranch_prefix_length): genattrtab can't bound a
 ;; symbol_ref, which would leave the minimum length unknown.
 (define_insn "tdm_cbranchhi4"
@@ -406,8 +421,12 @@
   [(set (attr "length")
 	(if_then_else
 	  (and (eq_attr "alternative" "0")
-	       (and (ge (minus (match_dup 3) (pc)) (const_int -56))
-		    (le (minus (match_dup 3) (pc)) (const_int 56))))
+	       (and (ge (minus (match_dup 3) (pc))
+			(plus (const_int CBRANCH_REACH_MIN)
+			      (symbol_ref "tdm_reach_margin")))
+		    (le (minus (match_dup 3) (pc))
+			(minus (const_int CBRANCH_REACH_MAX)
+			       (symbol_ref "tdm_reach_margin")))))
 	  (const_int 4)
 	  (const_int 8)))])
 
@@ -416,8 +435,12 @@
   ""
   "* return tdm_output_jump (operands[0], insn);"
   [(set (attr "length")
-	(if_then_else (and (ge (minus (match_dup 0) (pc)) (const_int -60))
-			   (le (minus (match_dup 0) (pc)) (const_int 60)))
+	(if_then_else (and (ge (minus (match_dup 0) (pc))
+			       (plus (const_int JUMP_REACH_MIN)
+				     (symbol_ref "tdm_reach_margin")))
+			   (le (minus (match_dup 0) (pc))
+			       (minus (const_int JUMP_REACH_MAX)
+				      (symbol_ref "tdm_reach_margin"))))
 		      (const_int 2)
 		      (const_int 4)))])
 
