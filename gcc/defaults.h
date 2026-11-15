@@ -1198,6 +1198,12 @@ see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
 #define ARGS_GROW_DOWNWARD 0
 #endif
 
+/* Whether __builtin___strub_leave may clear the stack with a loop
+   expanded inline, starting at the stack pointer.  */
+#ifndef TARGET_STRUB_INLINE_LEAVE
+#define TARGET_STRUB_INLINE_LEAVE 1
+#endif
+
 #ifndef STACK_GROWS_DOWNWARD
 #define STACK_GROWS_DOWNWARD 0
 #endif
